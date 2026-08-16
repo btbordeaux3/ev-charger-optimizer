@@ -4,8 +4,6 @@ __pycache__/
 .env
 data/raw/
 data/processed/
-data/output/
-data/output_durham/
 cache/
 *.ipynb_checkpoints/
 .DS_Store
