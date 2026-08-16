@@ -1,0 +1,49 @@
+# Region configuration for Durham County, NC (City+County of Durham).
+name: "Durham County NC"
+
+counties:
+  - name: "Durham"
+    state_fips: "37"
+    county_fips: "063"
+    state_abbr: NC
+
+nrel_api_key: ""
+census_api_key: ""
+
+municipal_layers: []
+road_network_source: "overpass"
+cache_dir: "data/raw"
+
+demand:
+  grid_resolution_m: 400
+  alpha_traffic: 1.0
+  beta_equity: 1.0
+  income_weighted_equity: false
+
+coverage:
+  radius_l2_m: 1609.34
+  radius_dcfc_m: 6437.38
+  dcfc_min_aadt: 0.0
+
+optimization:
+  k_sites: 5
+  min_l2: 2
+  min_dcfc: 3
+  gamma: 0.5
+  solver: "auto"
+  time_limit_s: 120
+  mip_gap: 0.01
+
+budget:
+  budget: 1500000
+  cost_l2: 50000
+  cost_dcfc: 150000
+  cap_l2: 15
+  cap_dcfc: 60
+  site_max: 12
+
+output:
+  out_dir: "data/output_durham"
+  map_path: "ev_charger_map.html"
+  results_path: "recommended_sites.csv"
+  charts_dir: "data/output_durham/charts"

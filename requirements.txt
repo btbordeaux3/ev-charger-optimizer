@@ -1,0 +1,15 @@
+geopandas>=0.13
+osmnx>=1.8
+shapely>=2.0
+pyproj>=3.5
+pygris>=0.3
+gurobipy>=10
+pulp>=2.7
+folium>=0.15
+matplotlib>=3.7
+requests>=2.31
+python-dotenv>=1.0
+pyyaml>=6.0
+tqdm>=4.66
+pandas>=2.0
+numpy>=1.24

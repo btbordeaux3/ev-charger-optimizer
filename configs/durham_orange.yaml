@@ -1,0 +1,67 @@
+# Region configuration for the Durham-Orange (NC) study area.
+#
+# This is the ONLY file a user needs to edit to run the pipeline for a new
+# region: set the counties (FIPS codes), API keys, and tune the model params.
+name: "Durham-Orange NC"
+
+counties:
+  - name: "Durham"
+    state_fips: "37"
+    county_fips: "063"
+    state_abbr: NC
+  - name: "Orange"
+    state_fips: "37"
+    county_fips: "135"
+    state_abbr: NC
+
+# API keys. Get a free NREL key at https://developer.nlr.gov/signup/ and a
+# Census key at https://api.census.gov/data/key_signup.html. You can also set
+# these as NREL_API_KEY / CENSUS_API_KEY environment variables instead.
+nrel_api_key: ""
+census_api_key: ""
+
+# Municipal open-data candidate sites (optional). If you have an ArcGIS Hub /
+# Socrata feature layer of government-owned sites, list it here. When empty the
+# pipeline falls back to OSM public-facility POIs (parking, libraries, town
+# halls, community centers) which work for any region.
+municipal_layers: []
+
+road_network_source: "overpass"
+cache_dir: "data/raw"
+
+demand:
+  grid_resolution_m: 400          # edge length of each demand cell (meters)
+  alpha_traffic: 1.0              # weight on AADT traffic demand
+  beta_equity: 1.0                # weight on equity (multifamily renter) demand
+  income_weighted_equity: false   # multiply equity by low-income factor
+
+coverage:
+  radius_l2_m: 1609.34            # Level 2 radius (~1 mi) for local residents
+  radius_dcfc_m: 6437.38          # DC fast radius (~4 mi) for corridor commuters
+  dcfc_min_aadt: 0.0              # only allow DCFC coverage of high-traffic cells
+
+optimization:
+  k_sites: 5                      # number of chargers to site (legacy MCLP model)
+  min_l2: 2                       # minimum Level 2 sites (local residents)
+  min_dcfc: 3                     # minimum DC fast sites (corridor)
+  gamma: 0.5                      # penalty on duplicated coverage (spread)
+  solver: "auto"                  # auto | gurobi | cbc
+  time_limit_s: 120
+  mip_gap: 0.01
+
+# Capacitated budget model (the primary tool): spend a fixed budget on any mix
+# of chargers, any site can host a cluster up to site_max, and charger capacity
+# caps how much nearby demand it can actually serve.
+budget:
+  budget: 1500000                 # total spend ($) on installed chargers
+  cost_l2: 50000                  # installed cost per Level 2 charger ($)
+  cost_dcfc: 150000               # installed cost per DC fast charger ($)
+  cap_l2: 15                      # demand units one L2 charger can serve
+  cap_dcfc: 60                    # demand units one DCFC charger can serve
+  site_max: 12                    # max chargers at a single site (parking cap)
+
+output:
+  out_dir: "data/output"
+  map_path: "ev_charger_map.html"
+  results_path: "recommended_sites.csv"
+  charts_dir: "data/output/charts"
