@@ -36,9 +36,11 @@ demand:
   income_weighted_equity: false   # multiply equity by low-income factor
 
 coverage:
-  radius_l2_m: 1609.34            # Level 2 radius (~1 mi) for local residents
-  radius_dcfc_m: 6437.38          # DC fast radius (~4 mi) for corridor commuters
-  dcfc_min_aadt: 0.0              # only allow DCFC coverage of high-traffic cells
+  l2_walk_time_min: 20              # Level 2 walking-time isochrone cap (min)
+  dcfc_drive_time_min: 20           # DC fast driving-time isochrone cap (min)
+  walk_speed_kph: 4.8               # assumed walking speed
+  drive_default_speed_kph: 35.0     # fallback drive speed (per-class from OSM tags)
+  dcfc_min_aadt: 0.0                # only allow DCFC coverage of high-traffic cells
 
 optimization:
   k_sites: 5                      # number of chargers to site (legacy MCLP model)
@@ -59,6 +61,35 @@ budget:
   cap_l2: 15                      # demand units one L2 charger can serve
   cap_dcfc: 60                    # demand units one DCFC charger can serve
   site_max: 12                    # max chargers at a single site (parking cap)
+
+# Optional: municipal zoning layer that refines WHERE census multifamily demand
+# really is. Cells inside multifamily-designated zones get their census equity
+# weight boosted by `cell_multiplier`. Leave layers empty to use pure census.
+# Example (city GIS ArcGIS feature service):
+#   layers:
+#     - "https://<city>/arcgis/rest/services/zoning/FeatureServer/0"
+#   multifamily_column: "ZONING"       # attribute holding the zone class
+#   multifamily_values: ["R-5", "RM", "RU-5"]   # values = multifamily zones
+zoning:
+  layers: []
+  multifamily_column: ""
+  multifamily_values: []
+  cell_multiplier: 1.5
+
+# Optional: post-optimization grid-feasibility check. After the MILP picks a
+# plan, each site's charger load (count * kW * simultaneity) is compared against
+# available hosting capacity from a utility feature layer; overloaded sites are
+# cut back and the MILP re-solved so the freed budget goes elsewhere. Needs a
+# hosting-capacity layer with a numeric capacity column (kVA). When disabled or
+# unconfigured the plan is used as-is.
+grid:
+  enabled: false
+  layers: []                       # e.g. utility ICA / transformer capacity layer
+  capacity_column: ""              # attribute with available capacity (kVA)
+  charger_power_kw: {l2: 7.2, dcfc: 150.0}
+  simultaneity: 1.0                # fraction of chargers loaded at peak
+  margin: 0.85                     # max fraction of capacity a site may use
+  max_iterations: 5
 
 output:
   out_dir: "data/output"

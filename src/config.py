@@ -85,10 +85,19 @@ class DemandConfig:
 
 @dataclass
 class CoverageConfig:
-    """Coverage radii by charger type (road-network distance in meters)."""
-    radius_l2_m: float = 1609.34   # Level 2 (~1 mi) - local residents
-    radius_dcfc_m: float = 6437.38 # DC fast (~4 mi) - corridor commuters
-    dcfc_min_aadt: float = 0.0     # only allow DCFC coverage of cells above this AADT
+    """Coverage isochrones by charger type (travel time, not distance).
+
+    Level 2 (slow) chargers serve local residents, so coverage is a WALKING-
+    TIME isochrone: OSM network travel time at ``walk_speed_kph``.
+    DC fast chargers serve corridor/commuter traffic, so coverage is a
+    DRIVING-TIME isochrone: OSM network travel time using per-road-class
+    speeds derived from the OSM ``highway`` tag.
+    """
+    l2_walk_time_min: float = 20.0       # Level 2 walking isochrone cap (min)
+    dcfc_drive_time_min: float = 20.0    # DC fast driving isochrone cap (min)
+    walk_speed_kph: float = 4.8          # assumed walking speed (km/h)
+    drive_default_speed_kph: float = 35.0  # fallback drive speed (km/h)
+    dcfc_min_aadt: float = 0.0           # only allow DCFC coverage of cells above this AADT
 
 
 @dataclass
@@ -125,6 +134,46 @@ class BudgetConfig:
 
 
 @dataclass
+class ZoningConfig:
+    """Optional zoning layer used to refine where apartment demand really is.
+
+    Census ACS gives multifamily household *counts* per tract/block-group but
+    not exact locations. A municipal zoning layer (ArcGIS feature service) tells
+    us which parcels are actually designated multifamily. Cells whose centroid
+    falls inside a multifamily-designated zone get their census multifamily
+    weight multiplied by `cell_multiplier`; cells elsewhere keep the census
+    value. Empty `layers` (the default) keeps the pure census behavior.
+    """
+    layers: list[str] = field(default_factory=list)      # ArcGIS feature-layer URLs
+    multifamily_column: str = ""                         # attribute holding the zone class
+    multifamily_values: list[str] = field(default_factory=list)  # values = multifamily
+    cell_multiplier: float = 1.5                         # boost for cells in MF zones
+
+
+@dataclass
+class GridConfig:
+    """Grid-feasibility check that runs AFTER optimization and re-solves.
+
+    The budget MILP optimizes siting ignoring the distribution grid. When
+    enabled, each recommended site's aggregate charger load (count * kW per
+    charger * simultaneity) is compared against the available hosting capacity
+    from a utility feature layer. Sites that exceed `margin` of their capacity
+    are cut back (proportionally to the overload) and the MILP is re-solved so
+    the freed budget is spent at other sites. Repeats until feasible or
+    `max_iterations`.
+    """
+    enabled: bool = False
+    layers: list[str] = field(default_factory=list)      # hosting-capacity feature layers
+    capacity_column: str = ""                            # available capacity attribute (kVA)
+    charger_power_kw: dict = field(
+        default_factory=lambda: {"l2": 7.2, "dcfc": 150.0}
+    )
+    simultaneity: float = 1.0        # fraction of chargers assumed loaded at peak
+    margin: float = 0.85             # max fraction of capacity a site may use
+    max_iterations: int = 5
+
+
+@dataclass
 class OutputConfig:
     out_dir: str = "data/output"
     map_path: str = "ev_charger_map.html"
@@ -149,6 +198,8 @@ class RegionConfig:
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    zoning: ZoningConfig = field(default_factory=ZoningConfig)
+    grid: GridConfig = field(default_factory=GridConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
     @property
@@ -205,8 +256,10 @@ def load_config(path: str) -> RegionConfig:
 
     cov_raw = raw.get("coverage", {})
     coverage = CoverageConfig(
-        radius_l2_m=cov_raw.get("radius_l2_m", 1609.34),
-        radius_dcfc_m=cov_raw.get("radius_dcfc_m", 6437.38),
+        l2_walk_time_min=cov_raw.get("l2_walk_time_min", 20.0),
+        dcfc_drive_time_min=cov_raw.get("dcfc_drive_time_min", 20.0),
+        walk_speed_kph=cov_raw.get("walk_speed_kph", 4.8),
+        drive_default_speed_kph=cov_raw.get("drive_default_speed_kph", 35.0),
         dcfc_min_aadt=cov_raw.get("dcfc_min_aadt", 0.0),
     )
 
@@ -231,6 +284,26 @@ def load_config(path: str) -> RegionConfig:
         site_max=budget_raw.get("site_max", 12),
     )
 
+    zone_raw = raw.get("zoning", {})
+    zoning = ZoningConfig(
+        layers=zone_raw.get("layers", []),
+        multifamily_column=zone_raw.get("multifamily_column", ""),
+        multifamily_values=zone_raw.get("multifamily_values", []),
+        cell_multiplier=zone_raw.get("cell_multiplier", 1.5),
+    )
+
+    grid_raw = raw.get("grid", {})
+    grid = GridConfig(
+        enabled=grid_raw.get("enabled", False),
+        layers=grid_raw.get("layers", []),
+        capacity_column=grid_raw.get("capacity_column", ""),
+        charger_power_kw=grid_raw.get("charger_power_kw",
+                                      {"l2": 7.2, "dcfc": 150.0}),
+        simultaneity=grid_raw.get("simultaneity", 1.0),
+        margin=grid_raw.get("margin", 0.85),
+        max_iterations=grid_raw.get("max_iterations", 5),
+    )
+
     out_raw = raw.get("output", {})
     output = OutputConfig(
         out_dir=out_raw.get("out_dir", "data/output"),
@@ -248,5 +321,7 @@ def load_config(path: str) -> RegionConfig:
         coverage=coverage,
         optimization=optimization,
         budget=budget,
+        zoning=zoning,
+        grid=grid,
         output=output,
     )

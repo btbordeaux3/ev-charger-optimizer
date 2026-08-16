@@ -112,6 +112,23 @@ def fetch_all(
         log.warning("ACS fetch failed: %s", e)
         out["tracts"] = gpd.GeoDataFrame({"geometry": []}, crs="EPSG:4326")
 
+    # 5. Zoning (optional) - refines census multifamily demand spatially
+    from src.fetch.zoning import fetch_zoning
+    out["zoning"] = fetch_zoning(
+        cfg.zoning.layers,
+        cfg.zoning.multifamily_column,
+        cfg.zoning.multifamily_values,
+        bbox=(west, south, east, north),
+    )
+
+    # 6. Grid hosting capacity (optional) - for the post-optimization check
+    from src.fetch.grid import fetch_grid_capacity
+    out["grid"] = fetch_grid_capacity(
+        cfg.grid.layers,
+        cfg.grid.capacity_column,
+        bbox=(west, south, east, north),
+    )
+
     return out
 
 
@@ -139,8 +156,10 @@ def run(cfg_path: str, **overrides) -> dict:
     aadt = data["aadt"]
     tracts = data["tracts"]
     existing = data["existing"]
+    zoning = data["zoning"]
+    grid_gdf = data["grid"]
 
-    # Build demand grid
+    # Build demand grid (census + optional zoning refinement)
     demand = build_demand(
         bounds=(west, south, east, north),
         aadt=aadt,
@@ -150,6 +169,8 @@ def run(cfg_path: str, **overrides) -> dict:
         beta=cfg.demand.beta_equity,
         income_weighted=cfg.demand.income_weighted_equity,
         region_geom=region,
+        zoning=zoning,
+        zoning_multiplier=cfg.zoning.cell_multiplier,
     )
     log.info("Demand cells: %d", len(demand))
 
@@ -162,12 +183,15 @@ def run(cfg_path: str, **overrides) -> dict:
         G=G,
         sites=sites,
         demand=demand,
-        radius_l2_m=cfg.coverage.radius_l2_m,
-        radius_dcfc_m=cfg.coverage.radius_dcfc_m,
+        l2_walk_time_min=cfg.coverage.l2_walk_time_min,
+        dcfc_drive_time_min=cfg.coverage.dcfc_drive_time_min,
+        walk_speed_kph=cfg.coverage.walk_speed_kph,
+        drive_default_speed_kph=cfg.coverage.drive_default_speed_kph,
         dcfc_min_aadt=cfg.coverage.dcfc_min_aadt,
     )
     A_l2, A_dcfc = cm.build()
-    log.info("Coverage matrix: %s / %s", A_l2.shape, A_dcfc.shape)
+    log.info("Coverage matrix: %s / %s (L2 walking / DCFC driving)",
+             A_l2.shape, A_dcfc.shape)
 
     # Solve the capacitated budget model + greedy baseline
     w = demand["demand"].values.astype(float)
@@ -189,6 +213,65 @@ def run(cfg_path: str, **overrides) -> dict:
         mip_gap=cfg.optimization.mip_gap,
         initial_solution=greedy["site_chargers"],
     )
+
+    # ---- grid feasibility: solve -> check -> tighten -> re-solve ----
+    grid_status = {
+        "enabled": bool(cfg.grid.enabled),
+        "iterations": 0,
+        "violations": [],
+        "constrained": False,
+        "final_feasible": False,
+    }
+    if cfg.grid.enabled and grid_gdf is not None and not grid_gdf.empty:
+        from src.model.grid_check import site_capacity, feasible_site_max
+
+        grid_cap = site_capacity(sites, grid_gdf, cfg.grid.capacity_column)
+        allowed = None
+        allowed, violations = feasible_site_max(
+            opt["site_chargers"], grid_cap,
+            power_kw=cfg.grid.charger_power_kw,
+            simultaneity=cfg.grid.simultaneity,
+            margin=cfg.grid.margin,
+            default_site_max=b.site_max,
+            previous=allowed,
+        )
+        grid_status["violations"] = violations
+        it = 0
+        while violations and it < cfg.grid.max_iterations:
+            it += 1
+            log.warning(
+                "Grid check: %d site(s) overloaded (iteration %d): %s",
+                len(violations), it,
+                [(v["site"], v["load_kva"], v["capacity_kva"]) for v in violations],
+            )
+            opt = solve_budget(
+                w, A_l2, A_dcfc,
+                budget=b.budget,
+                cost=cost,
+                capacity=capacity,
+                site_max=allowed,
+                solver=cfg.optimization.solver,
+                time_limit_s=cfg.optimization.time_limit_s,
+                mip_gap=cfg.optimization.mip_gap,
+                initial_solution=opt["site_chargers"],
+            )
+            allowed, violations = feasible_site_max(
+                opt["site_chargers"], grid_cap,
+                power_kw=cfg.grid.charger_power_kw,
+                simultaneity=cfg.grid.simultaneity,
+                margin=cfg.grid.margin,
+                default_site_max=b.site_max,
+                previous=allowed,
+            )
+            grid_status["iterations"] = it
+            grid_status["violations"] = violations
+        grid_status["constrained"] = it > 0
+        grid_status["final_feasible"] = not violations
+        log.info(
+            "Grid check done: %s (iterations=%d, violations=%d)",
+            "feasible" if not violations else "STILL VIOLATED",
+            it, len(violations),
+        )
 
     # ---- outputs ----
     os.makedirs(cfg.output.out_dir, exist_ok=True)
@@ -223,8 +306,8 @@ def run(cfg_path: str, **overrides) -> dict:
         metrics_opt=opt["metrics"],
         metrics_greedy=greedy["metrics"],
         k_sites=opt["metrics"]["n_chargers_total"],
-        radius_l2_m=cfg.coverage.radius_l2_m,
-        radius_dcfc_m=cfg.coverage.radius_dcfc_m,
+        l2_walk_time_min=cfg.coverage.l2_walk_time_min,
+        dcfc_drive_time_min=cfg.coverage.dcfc_drive_time_min,
         gamma=cfg.optimization.gamma,
         solver=cfg.optimization.solver,
         budget=b.budget,
@@ -246,6 +329,9 @@ def run(cfg_path: str, **overrides) -> dict:
         "A_dcfc": A_dcfc,
         "optimized": opt,
         "greedy": greedy,
+        "grid": grid_status,
+        "zoning": zoning,
+        "grid_capacity": grid_gdf,
     }
 
 

@@ -129,14 +129,43 @@ def assign_equity(
     return cells
 
 
+def assign_zoning(
+    cells: gpd.GeoDataFrame,
+    zoning: gpd.GeoDataFrame | None,
+) -> gpd.GeoDataFrame:
+    """Flag cells whose centroid falls inside a multifamily-designated zone.
+
+    Census tract/block-group counts give *how many* apartment households but not
+    *where*. A zoning layer (with a boolean ``is_multifamily`` column) pinpoints
+    which parcels are actually designated for apartments, so cells inside those
+    zones are upweighted when the demand is combined (see ``compute_demand``).
+    """
+    cells["zoning_multifamily"] = False
+    if zoning is None or zoning.empty or "is_multifamily" not in zoning.columns:
+        return cells
+    mf = zoning[zoning["is_multifamily"]]
+    if mf.empty:
+        return cells
+    pts = gpd.GeoDataFrame(geometry=cells["centroid_proj"], crs=32617)
+    mf_proj = mf.to_crs(32617)
+    joined = gpd.sjoin(pts, mf_proj[["geometry"]], how="left", predicate="within")
+    inside = joined.index[joined["index_right"].notna()]
+    cells["zoning_multifamily"] = cells.index.isin(inside)
+    return cells
+
+
 def compute_demand(
     cells: gpd.GeoDataFrame,
     alpha: float = 1.0,
     beta: float = 1.0,
+    zoning_multiplier: float = 1.5,
 ) -> gpd.GeoDataFrame:
     """Compute the composite demand weight per cell.
 
     Normalises traffic and equity to [0, 1] then combines with alpha/beta.
+    If zoning data is present, cells inside multifamily-designated zones get
+    their equity term multiplied by ``zoning_multiplier`` (census + zoning
+    combined).
     """
     def norm(s):
         s = pd.to_numeric(s, errors="coerce").fillna(0.0)
@@ -147,6 +176,9 @@ def compute_demand(
 
     traffic_norm = norm(cells["traffic_count"])
     equity_norm = norm(cells["equity_count"])
+    if "zoning_multifamily" in cells.columns:
+        mf = cells["zoning_multifamily"].fillna(False).to_numpy()
+        equity_norm = np.where(mf, equity_norm * zoning_multiplier, equity_norm)
     cells["traffic_norm"] = traffic_norm
     cells["equity_norm"] = equity_norm
     cells["demand"] = alpha * traffic_norm + beta * equity_norm
@@ -162,6 +194,8 @@ def build_demand(
     beta: float = 1.0,
     income_weighted: bool = False,
     region_geom=None,
+    zoning: gpd.GeoDataFrame | None = None,
+    zoning_multiplier: float = 1.5,
 ) -> gpd.GeoDataFrame:
     """End-to-end demand construction for a region."""
     cells = make_grid(bounds, cell_size_m, region_geom)
@@ -172,5 +206,6 @@ def build_demand(
     else:
         cells["traffic_count"] = cells.get("traffic_count", 0.0)
         cells["equity_count"] = 0.0
-    cells = compute_demand(cells, alpha, beta)
+    cells = assign_zoning(cells, zoning)
+    cells = compute_demand(cells, alpha, beta, zoning_multiplier)
     return cells

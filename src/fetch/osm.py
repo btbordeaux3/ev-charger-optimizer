@@ -138,6 +138,7 @@ out body geom;
         except Exception:
             return []
         lines = []
+        classes = []
         for el in data.get("elements", []):
             if el["type"] == "way" and el.get("tags", {}).get("highway") \
                     and _valid_way(el):
@@ -146,21 +147,23 @@ out body geom;
                 coords = [(g["lon"], g["lat"]) for g in geom]
                 if len(coords) >= 2:
                     lines.append(LineString(coords))
-        return lines
+                    classes.append(el["tags"]["highway"])
+        return lines, classes
 
     all_gdfs = []
     with ThreadPoolExecutor(max_workers=_TILE_WORKERS) as ex:
-        for lines in ex.map(fetch_tile, tiles):
+        for lines, classes in ex.map(fetch_tile, tiles):
             if lines:
                 all_gdfs.append(
                     gpd.GeoDataFrame(
-                        {"geometry": lines, "osmid": range(len(lines))},
+                        {"geometry": lines, "highway": classes,
+                         "osmid": range(len(lines))},
                         crs="EPSG:4326",
                     )
                 )
 
     if not all_gdfs:
-        return gpd.GeoDataFrame({"geometry": [], "osmid": []}, crs="EPSG:4326")
+        return gpd.GeoDataFrame({"geometry": [], "osmid": [], "highway": []}, crs="EPSG:4326")
     gdf = gpd.GeoDataFrame(pd.concat(all_gdfs, ignore_index=True), crs="EPSG:4326")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_file(cache_path, driver="GeoJSON")

@@ -294,7 +294,9 @@ def solve_budget(
     budget   : total spend ($)
     cost     : {'l2': float, 'dcfc': float} installed $ per charger
     capacity : {'l2': float, 'dcfc': float} demand units one charger can serve
-    site_max : max total chargers at any single site (parking/cluster cap)
+    site_max : int or (n_sites,) array-like of ints. Max total chargers at each
+               single site. A scalar applies everywhere (the parking cap); an
+               array lets the grid-feasibility pass cap individual sites.
     initial_solution : [(site_idx, 'l2'/'dcfc', count), ...] warm start (e.g. the
         greedy baseline). Seeding the MIP with a good feasible plan guarantees
         the returned objective is never worse than that plan.
@@ -310,6 +312,9 @@ def solve_budget(
     cost_arr = np.array([cost["l2"], cost["dcfc"]], dtype=float)
     cap_arr = np.array([capacity["l2"], capacity["dcfc"]], dtype=float)
     A = np.stack([A_l2, A_dcfc]).astype(int)  # (2, n_sites, n_demand)
+    site_max_arr = np.broadcast_to(
+        np.asarray(site_max, dtype=float), (n_sites,)
+    )
 
     if solver == "auto":
         solvers = _available_solvers()
@@ -317,12 +322,12 @@ def solve_budget(
 
     if solver == "gurobi":
         return _solve_budget_gurobi(
-            demand_w, A, cost_arr, cap_arr, budget, site_max,
+            demand_w, A, cost_arr, cap_arr, budget, site_max_arr,
             time_limit_s, mip_gap, initial_solution,
         )
     elif solver == "cbc":
         return _solve_budget_cbc(
-            demand_w, A, cost_arr, cap_arr, budget, site_max, time_limit_s
+            demand_w, A, cost_arr, cap_arr, budget, site_max_arr, time_limit_s
         )
     else:
         raise ValueError(f"Unknown solver: {solver}. Choose from {SOLVERS}")
@@ -413,7 +418,7 @@ def _solve_budget_gurobi(demand_w, A, cost, cap, budget, site_max,
         name="budget",
     )
     for j in range(n_sites):
-        m.addConstr(y[j, 0] + y[j, 1] <= site_max, name=f"sitemax_{j}")
+        m.addConstr(y[j, 0] + y[j, 1] <= site_max[j], name=f"sitemax_{j}")
     for i in range(n_demand):
         m.addConstr(
             gp.quicksum(f[j, t, i] for j in range(n_sites) for t in range(2)
@@ -461,7 +466,7 @@ def _solve_budget_cbc(demand_w, A, cost, cap, budget, site_max, time_limit_s):
     prob += pulp.lpSum(f.values())
     prob += pulp.lpSum(cost[t] * y[j, t] for j in range(n_sites) for t in range(2)) <= budget
     for j in range(n_sites):
-        prob += y[j, 0] + y[j, 1] <= site_max
+        prob += y[j, 0] + y[j, 1] <= site_max[j]
     for i in range(n_demand):
         prob += pulp.lpSum(f[j, t, i] for j in range(n_sites) for t in range(2)
                            if (j, t, i) in f) <= demand_w[i]

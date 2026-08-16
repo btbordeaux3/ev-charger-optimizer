@@ -120,6 +120,9 @@ def greedy_budget(
                   np.asarray(A_dcfc, dtype=bool)])  # (2, n_sites, n_demand)
     cost_arr = np.array([cost["l2"], cost["dcfc"]], dtype=float)
     cap_arr = np.array([capacity["l2"], capacity["dcfc"]], dtype=float)
+    site_max_arr = np.broadcast_to(
+        np.asarray(site_max, dtype=float), (n_sites,)
+    )
 
     y = np.zeros((n_sites, 2), dtype=int)
     spent = 0.0
@@ -130,7 +133,7 @@ def greedy_budget(
         best = None
         best_gain = -1.0
         for j in range(n_sites):
-            if y[j].sum() >= site_max:
+            if y[j].sum() >= site_max_arr[j]:
                 continue
             for t in range(2):
                 if spent + cost_arr[t] > budget + 1e-9:

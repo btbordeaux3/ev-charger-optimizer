@@ -21,8 +21,10 @@ demand:
   income_weighted_equity: false
 
 coverage:
-  radius_l2_m: 1609.34
-  radius_dcfc_m: 6437.38
+  l2_walk_time_min: 20
+  dcfc_drive_time_min: 20
+  walk_speed_kph: 4.8
+  drive_default_speed_kph: 35.0
   dcfc_min_aadt: 0.0
 
 optimization:
@@ -41,6 +43,21 @@ budget:
   cap_l2: 15
   cap_dcfc: 60
   site_max: 12
+
+zoning:
+  layers: []
+  multifamily_column: ""
+  multifamily_values: []
+  cell_multiplier: 1.5
+
+grid:
+  enabled: false
+  layers: []
+  capacity_column: ""
+  charger_power_kw: {l2: 7.2, dcfc: 150.0}
+  simultaneity: 1.0
+  margin: 0.85
+  max_iterations: 5
 
 output:
   out_dir: "data/output_durham"

@@ -25,16 +25,23 @@ the MILP — no manual data prep.
    - NREL existing chargers → context / over-clustering layer
 2. **Builds a weighted demand grid** over the region:
    `demand = alpha·norm(AADT) + beta·norm(multifamily renter units)`
-3. **Computes road-network coverage matrices** (single-source Dijkstra with a
-   Euclidean pre-filter) for two charger types:
-   - Level 2 (radius 1 mi) — serves local residents
-   - DC fast (radius 4 mi) — serves corridor/commuter traffic
+3. **Computes coverage matrices by charger type and trip mode** as **travel-time
+   isochrones** over the OSM network (the "20-minute city" idea):
+   - Level 2 (slow) — a **walking-time** isochrone: network travel time at
+     `walk_speed_kph` (4.8 km/h), capped at `l2_walk_time_min` (default 20 min)
+   - DC fast — a **driving-time** isochrone: network travel time using
+     per-road-class speeds from the OSM `highway` tag (motorway 110 km/h …
+     residential 30 km/h), capped at `dcfc_drive_time_min` (default 20 min)
 4. **Solves the capacitated budget model** with Gurobi (falls back to CBC/PuLP):
    - maximize demand units served, subject to a total budget
    - charger throughput caps (L2 = 15 units, DCFC = 60 units)
    - per-site parking cap (`site_max` chargers) so clusters stay feasible
    - warm-started from the greedy baseline so the optimizer is never worse
-5. **Emits deliverables**:
+5. **(Optional) grid-feasibility check + re-solve** — after the MILP picks a
+   plan, each site's charger load (count × kW × simultaneity) is compared
+   against available hosting capacity from a utility feature layer; overloaded
+   sites are cut back and the MILP re-solved so freed budget flows elsewhere.
+6. **Emits deliverables**:
    - interactive `folium` map (`ev_charger_map.html`) with per-site charger
      cluster counts
    - ranked site CSV (`recommended_sites.csv`) with `charger_count`
@@ -102,12 +109,21 @@ pipeline falls back to OSM parking areas (works for any region).
 See `configs/durham_orange.yaml` for the full set of knobs:
 
 | Section | Key | Default | Meaning |
-|---|---|---|---|
+|---|---|---|---|---|
 | `demand` | `grid_resolution_m` | 400 | demand cell edge length (m) |
 | `demand` | `alpha_traffic` / `beta_equity` | 1.0 / 1.0 | demand weighting |
 | `demand` | `income_weighted_equity` | false | upweight low-income tracts |
-| `coverage` | `radius_l2_m` | 1609.34 | Level-2 radius (~1 mi) |
-| `coverage` | `radius_dcfc_m` | 6437.38 | DC-fast radius (~4 mi) |
+| `coverage` | `l2_walk_time_min` | 20 | Level-2 **walking-time** isochrone cap (min) |
+| `coverage` | `dcfc_drive_time_min` | 20 | DC-fast **driving-time** isochrone cap (min) |
+| `coverage` | `walk_speed_kph` | 4.8 | assumed walking speed for walk isochrones |
+| `coverage` | `drive_default_speed_kph` | 35 | fallback drive speed (per-class from OSM) |
+| `zoning` | `layers` | [] | ArcGIS zoning layers for MF demand refinement |
+| `zoning` | `multifamily_column` / `multifamily_values` | "" / [] | zone attribute + values = multifamily |
+| `zoning` | `cell_multiplier` | 1.5 | boost census equity in MF-zoned cells |
+| `grid` | `enabled` | false | run post-optimization grid feasibility |
+| `grid` | `layers` / `capacity_column` | [] / "" | hosting-capacity layer + kVA column |
+| `grid` | `charger_power_kw` | l2 7.2 / dcfc 150 | kW per charger for load calc |
+| `grid` | `simultaneity` / `margin` / `max_iterations` | 1.0 / 0.85 / 5 | peak-load factor, capacity margin, re-solves |
 | `budget` | `budget` | 1500000 | total spend ($) |
 | `budget` | `cost_l2` / `cost_dcfc` | 50000 / 150000 | installed cost per charger |
 | `budget` | `cap_l2` / `cap_dcfc` | 15 / 60 | demand units one charger serves |
@@ -122,8 +138,10 @@ See `configs/durham_orange.yaml` for the full set of knobs:
 configs/            region configs (plug-and-play entry)
 src/
   config.py         dataclasses + YAML loader
-  fetch/            nrel, ndot (AADT), acs (Census), osm (Overpass), arcgis, network
-  model/            demand grid, coverage matrix, budget/MCLP optimizers
+  fetch/            nrel, ndot (AADT), acs (Census), osm (Overpass),
+                    arcgis, zoning, grid, network
+  model/            demand grid, coverage matrix, budget/MCLP optimizers,
+                    grid_check (post-optimization grid feasibility)
   analysis/         greedy baselines (MCLP + capacitated budget)
   viz/              folium map + matplotlib charts
   web/              static dashboard builder + stdlib web server

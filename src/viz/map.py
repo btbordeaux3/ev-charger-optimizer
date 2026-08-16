@@ -72,8 +72,8 @@ def folium_map(
     import folium
     from folium.plugins import MarkerCluster
 
-    m = folium.Map(location=[demand.geometry.centroid.y.mean(),
-                             demand.geometry.centroid.x.mean()], zoom_start=11)
+    c = demand.geometry.to_crs(4326).unary_union.centroid
+    m = folium.Map(location=[c.y, c.x], zoom_start=11)
 
     # Demand layer: color cells by weight
     norm_demand = demand["demand"].values

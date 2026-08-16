@@ -157,7 +157,7 @@ _TEMPLATE = """<!DOCTYPE html>
 <header>
   <h1>⚡ EV Charger Placement · {region}</h1>
   <p>Equity-aware capacitated charger placement · budget ${budget:,.0f} ·
-     L2 {l2:.0f} m · DCFC {dcfc:.0f} m · {solver}</p>
+     L2 walk {l2:.0f} min · DCFC drive {dcfc:.0f} min · {solver}</p>
 </header>
 <main>
   <div class="cards">{cards}</div>
@@ -197,8 +197,8 @@ def build_dashboard(
     metrics_opt: dict = None,
     metrics_greedy: dict = None,
     k_sites: int = 5,
-    radius_l2_m: float = 1609.34,
-    radius_dcfc_m: float = 6437.38,
+    l2_walk_time_min: float = 20.0,
+    dcfc_drive_time_min: float = 20.0,
     gamma: float = 0.5,
     solver: str = "auto",
     budget: float = 1_500_000.0,
@@ -220,8 +220,8 @@ def build_dashboard(
         region=region,
         k=k_sites,
         budget=budget,
-        l2=radius_l2_m,
-        dcfc=radius_dcfc_m,
+        l2=l2_walk_time_min,
+        dcfc=dcfc_drive_time_min,
         gamma=gamma,
         solver=solver,
         cards=_cards_html(metrics_opt, metrics_greedy),
