@@ -1,0 +1,2 @@
+# Optional. Install only if you have/want a usable Gurobi license.
+gurobipy>=12

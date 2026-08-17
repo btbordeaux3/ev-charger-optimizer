@@ -1,108 +1,107 @@
-"""Build a static, locally-hostable dashboard for the EV charger results.
-
-Produces a single self-contained `index.html` that embeds:
-  - the folium interactive map (from the saved HTML file, in an iframe)
-  - the optimization vs. greedy before/after chart
-  - the gamma-sensitivity chart
-  - the equity income-profile chart
-  - a table of recommended sites
-  - a summary stat panel
-
-Host it locally with the included stdlib server:
-    python -m src.web.serve 8000
-"""
+"""Build the self-contained local HTML dashboard."""
 from __future__ import annotations
 
 import base64
+import html
 import os
 from pathlib import Path
 
 import pandas as pd
 
-# Summary metric cards shown at the top of the dashboard.
-# Budget model (primary): demand units served, chargers built, sites used, spend.
-_BUDGET_METRIC_LABELS = [
-    ("demand_units_served", "Demand served (units)"),
-    ("n_chargers_total", "Chargers built"),
-    ("n_sites_used", "Sites used"),
-    ("budget_spent", "Budget spent"),
-]
-_BUDGET_CARDS = {
-    "demand_units_served": lambda v: f"{v:,.0f}",
-    "n_chargers_total": lambda v: f"{int(v)}",
-    "n_sites_used": lambda v: f"{int(v)}",
-    "budget_spent": lambda v: f"${v:,.0f}",
-}
 
-# Legacy MCLP model.
-_METRIC_LABELS = [
-    ("k_sites", "Chargers sited"),
-    ("frac_weight_covered", "Demand covered"),
-    ("duplicated_coverage", "Redundant overlaps"),
-    ("mean_coverage_per_covered", "Avg coverage / cell"),
-]
-
-_CARDS = {
-    "frac_weight_covered": lambda v: f"{v*100:.1f}%",
-    "duplicated_coverage": lambda v: f"{int(v)}",
-    "mean_coverage_per_covered": lambda v: f"{v:.2f}",
-    "k_sites": lambda v: f"{int(v)}",
-}
-
-
-def _b64(path: str) -> str:
+def _b64_or_none(path: str) -> str | None:
+    if not os.path.exists(path):
+        return None
     with open(path, "rb") as f:
         return "data:image/png;base64," + base64.b64encode(f.read()).decode()
 
 
-def _results_html(csv_path: str) -> str:
+def _table_html(csv_path: str, *, percent_columns: set[str] | None = None, max_rows: int = 0) -> str:
     if not os.path.exists(csv_path):
-        return "<p>No results.</p>"
+        return "<p class='muted'>No results generated.</p>"
     df = pd.read_csv(csv_path)
-    rows = ""
+    if df.empty:
+        return "<p class='muted'>No rows generated.</p>"
+    truncated = False
+    total_rows = len(df)
+    if max_rows and total_rows > max_rows:
+        df = df.head(max_rows).copy()
+        truncated = True
+    percent_columns = percent_columns or set()
+    head = "".join(f"<th>{html.escape(str(c))}</th>" for c in df.columns)
+    rows = []
     for _, r in df.iterrows():
-        cols = "".join(f"<td>{r[c]}</td>" for c in df.columns)
-        rows += f"<tr>{cols}</tr>"
-    head = "".join(f"<th>{c}</th>" for c in df.columns)
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>"
+        vals = []
+        for c in df.columns:
+            value = r[c]
+            if c in percent_columns and pd.notna(value):
+                text = f"{float(value) * 100:.1f}%"
+            elif isinstance(value, float) and pd.notna(value):
+                text = f"{value:,.3f}".rstrip("0").rstrip(".")
+            else:
+                text = str(value)
+            vals.append(f"<td>{html.escape(text)}</td>")
+        rows.append("<tr>" + "".join(vals) + "</tr>")
+    table = f"<div class='table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    if truncated:
+        table += f"<p class='muted'>Showing first {len(df):,} of {total_rows:,} rows. Full audit is in the CSV.</p>"
+    return table
 
 
-def _cards_html(metrics_opt: dict, metrics_greedy: dict) -> str:
-    budget_style = "demand_units_served" in metrics_opt
-    if budget_style:
-        labels, cards = _BUDGET_METRIC_LABELS, _BUDGET_CARDS
-    else:
-        labels, cards = _METRIC_LABELS, _CARDS
-    out = ""
-    for key, label in labels:
-        v_opt = metrics_opt.get(key, 0)
-        v_gr = metrics_greedy.get(key, 0)
-        fmt = cards.get(key, str)
-        try:
-            opt_s = fmt(v_opt)
-        except Exception:
-            opt_s = str(v_opt)
-        try:
-            gr_s = fmt(v_gr)
-        except Exception:
-            gr_s = str(v_gr)
-        if key == "budget_spent":
-            cls = ""
-        else:
-            try:
-                better = (v_opt >= v_gr) if key in {
-                    "demand_units_served", "n_chargers_total", "n_sites_used",
-                    "frac_weight_covered"} else (v_opt <= v_gr)
-            except Exception:
-                better = True
-            cls = "good" if better else "bad"
-        out += f"""
-        <div class="card {cls}">
-          <div class="label">{label}</div>
-          <div class="value">{opt_s}</div>
-          <div class="sub">greedy: {gr_s}</div>
-        </div>"""
-    return out
+def _cards_html(metrics_opt: dict, metrics_greedy: dict, coverage_csv: str, regulatory_csv: str = "") -> str:
+    cards = []
+
+    def card(label, value, sub=""):
+        cards.append(
+            f"<div class='card'><div class='label'>{html.escape(label)}</div>"
+            f"<div class='value'>{html.escape(str(value))}</div>"
+            f"<div class='sub'>{html.escape(str(sub))}</div></div>"
+        )
+
+    card(
+        "Demand units served",
+        f"{metrics_opt.get('demand_units_served', 0):,.0f}",
+        f"greedy {metrics_greedy.get('demand_units_served', 0):,.0f}",
+    )
+    card(
+        "Distinct sites",
+        int(metrics_opt.get("n_sites_used", 0)),
+        f"{int(metrics_opt.get('n_chargers_total', 0))} chargers total",
+    )
+    card(
+        "Budget spent",
+        f"${metrics_opt.get('budget_spent', 0):,.0f}",
+        f"solver {metrics_opt.get('solver_used', 'n/a')}",
+    )
+
+    if os.path.exists(coverage_csv):
+        cov = pd.read_csv(coverage_csv)
+        row = cov[(cov["mode"] == "either") & (cov["threshold_min"].astype(float) == 10.0)]
+        if not row.empty:
+            r = row.iloc[0]
+            card(
+                "10-min combined access",
+                f"{float(r['weighted_demand_fraction']) * 100:.1f}%",
+                f"population {float(r['population_fraction']) * 100:.1f}% · land {float(r['land_area_fraction']) * 100:.1f}%",
+            )
+    if regulatory_csv and os.path.exists(regulatory_csv):
+        reg = pd.read_csv(regulatory_csv)
+        if not reg.empty:
+            matched = reg.get("parcel_id", pd.Series([""] * len(reg))).fillna("").astype(str).str.len().gt(0).sum()
+            review = reg.get("reg_manual_review", pd.Series([False] * len(reg))).astype(str).str.lower().isin(["true", "1"]).sum()
+            card(
+                "Regulatory context",
+                f"{matched}/{len(reg)} matched",
+                f"{review} candidate(s) flagged for manual review",
+            )
+    return "".join(cards)
+
+
+def _chart_html(path: str, alt: str) -> str:
+    src = _b64_or_none(path)
+    if src is None:
+        return f"<div class='chart-missing'>No {html.escape(alt)} chart available for this run.</div>"
+    return f'<figure><img src="{src}" alt="{html.escape(alt)}"></figure>'
 
 
 _TEMPLATE = """<!DOCTYPE html>
@@ -112,80 +111,30 @@ _TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EV Charger Placement · {region}</title>
 <style>
-  :root {{
-    --bg:#0f1720; --card:#17222e; --line:#2b3a4b;
-    --good:#2ecc71; --bad:#e74c3c; --txt:#cbd5e1; --hi:#f1f5f9;
-  }}
-  * {{ box-sizing:border-box; margin:0; padding:0; }}
-  body {{ background:var(--bg); color:var(--txt); font-family:-apple-system,
-         "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
-  header {{ padding:24px 32px; border-bottom:1px solid var(--line);
-           background:linear-gradient(180deg,#14202c,#0f1720); }}
-  header h1 {{ color:var(--hi); font-size:22px; }}
-  header p {{ margin-top:4px; font-size:13px; opacity:.75; }}
-  main {{ max-width:1200px; margin:0 auto; padding:24px 32px; }}
-  .cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
-           gap:14px; margin-bottom:28px; }}
-  .card {{ background:var(--card); border:1px solid var(--line); border-radius:10px;
-          padding:16px; }}
-  .card .label {{ font-size:12px; text-transform:uppercase; letter-spacing:.5px;
-                 opacity:.7; }}
-  .card .value {{ font-size:28px; font-weight:700; color:var(--hi); }}
-  .card.good .value {{ color:var(--good); }}
-  .card.bad .value {{ color:var(--bad); }}
-  .card .sub {{ font-size:12px; margin-top:6px; opacity:.6; }}
-  section {{ margin-bottom:28px; }}
-  h2 {{ color:var(--hi); font-size:16px; margin-bottom:10px;
-       padding-bottom:6px; border-bottom:1px solid var(--line); }}
-  .map-frame {{ width:100%; height:560px; border:1px solid var(--line);
-                border-radius:10px; overflow:hidden; }}
-  .map-frame iframe {{ width:100%; height:100%; border:0; }}
-  .chart-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
-                gap:14px; }}
-  .chart-grid img {{ width:100%; background:var(--card); border:1px solid var(--line);
-                     border-radius:10px; padding:8px; }}
-  table {{ width:100%; border-collapse:collapse; background:var(--card);
-          border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
-  th,td {{ text-align:left; padding:10px 12px; font-size:13px; }}
-  th {{ background:#1d2b3a; color:var(--hi); text-transform:uppercase;
-       font-size:11px; letter-spacing:.5px; }}
-  td {{ border-top:1px solid var(--line); }}
-  .foot {{ color:#7f8fa6; font-size:12px; padding:20px 32px; text-align:center; }}
+:root{{--bg:#0b1220;--panel:#111b2e;--line:#273449;--txt:#cbd5e1;--hi:#f8fafc;--accent:#facc15;}}
+*{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+header{{padding:24px 32px;border-bottom:1px solid var(--line);background:#0f192a}} h1{{margin:0;color:var(--hi);font-size:23px}} header p{{margin:6px 0 0;opacity:.72;font-size:13px}}
+main{{max-width:1280px;margin:auto;padding:24px 30px}} .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:12px;margin-bottom:26px}}
+.card{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}} .label{{font-size:11px;letter-spacing:.07em;text-transform:uppercase;opacity:.7}} .value{{font-size:28px;font-weight:750;color:var(--hi);margin-top:3px}} .sub{{font-size:12px;margin-top:5px;opacity:.65}}
+section{{margin:0 0 28px}} h2{{font-size:16px;color:var(--hi);padding-bottom:7px;border-bottom:1px solid var(--line)}} .map{{height:600px;border:1px solid var(--line);border-radius:12px;overflow:hidden}} iframe{{width:100%;height:100%;border:0}}
+.notice{{background:#172033;border:1px solid #3b4a63;border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.5;margin:0 0 12px}}
+.chart-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}} figure{{margin:0}} figure img,.chart-missing{{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px}} .chart-missing{{min-height:130px;display:grid;place-items:center;opacity:.65}}
+.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px}} table{{width:100%;border-collapse:collapse;background:var(--panel)}} th,td{{padding:9px 11px;text-align:left;white-space:nowrap;font-size:12px}} th{{background:#18253a;color:var(--hi);font-size:10px;text-transform:uppercase;letter-spacing:.06em}} td{{border-top:1px solid var(--line)}} .muted{{opacity:.65}}
+footer{{padding:22px;text-align:center;font-size:11px;opacity:.55}}
 </style>
 </head>
 <body>
-<header>
-  <h1>⚡ EV Charger Placement · {region}</h1>
-  <p>Equity-aware capacitated charger placement · budget ${budget:,.0f} ·
-     L2 walk {l2:.0f} min · DCFC drive {dcfc:.0f} min · {solver}</p>
-</header>
+<header><h1>⚡ EV Charger Placement · {region}</h1><p>Network-time accessibility · L2 walk {l2:g} min · DCFC drive {dcfc:g} min · routing {routing_backend} · optimization {solver}</p></header>
 <main>
-  <div class="cards">{cards}</div>
-
-  <section>
-    <h2>Interactive map</h2>
-    <div class="map-frame">{map_iframe}</div>
-  </section>
-
-  <section>
-    <h2>Charts</h2>
-    <div class="chart-grid">
-      <figure><img src="{b64_ba}" alt="before/after"></figure>
-      <figure><img src="{b64_mix}" alt="charger mix"></figure>
-      <figure><img src="{b64_equity}" alt="equity profile"></figure>
-    </div>
-  </section>
-
-  <section>
-    <h2>Recommended sites</h2>
-    {results_table}
-  </section>
+<div class="cards">{cards}</div>
+<section><h2>Interactive accessibility map</h2><div class="map"><iframe src="map.html"></iframe></div></section>
+<section><h2>Plan comparison</h2><div class="chart-grid">{chart_ba}{chart_mix}{chart_equity}</div></section>
+<section><h2>Accessibility coverage</h2>{coverage_table}</section>
+{regulatory_section}
+<section><h2>Recommended sites</h2>{results_table}</section>
 </main>
-<div class="foot">Generated by the EV Charger Placement pipeline ·
-   OpenStreetMap © contributors · NCDOT · US Census ACS · NREL/RPL</div>
-</body>
-</html>
-"""
+<footer>Generated locally by EV Charger Optimizer V3 · OpenStreetMap contributors · public transportation/energy/regulatory datasets</footer>
+</body></html>"""
 
 
 def build_dashboard(
@@ -193,44 +142,58 @@ def build_dashboard(
     map_html: str,
     charts_dir: str,
     results_csv: str,
-    region: str = "Durham-Orange NC",
-    metrics_opt: dict = None,
-    metrics_greedy: dict = None,
-    k_sites: int = 5,
-    l2_walk_time_min: float = 20.0,
-    dcfc_drive_time_min: float = 20.0,
-    gamma: float = 0.5,
-    solver: str = "auto",
-    budget: float = 1_500_000.0,
+    coverage_csv: str,
+    regulatory_csv: str = "",
+    *,
+    region: str,
+    metrics_opt: dict,
+    metrics_greedy: dict,
+    l2_walk_time_min: float,
+    dcfc_drive_time_min: float,
+    solver: str,
+    routing_backend: str,
+    budget: float,
+    regulations_enabled: bool = False,
+    regulations_jurisdiction: str = "",
+    regulations_as_of: str = "",
 ) -> str:
-    """Assemble and write the static dashboard to `out_html`."""
-    metrics_opt = metrics_opt or {}
-    metrics_greedy = metrics_greedy or {}
+    """Assemble and write the local static dashboard."""
+    out = Path(out_html)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    map_target = out.parent / "map.html"
+    map_target.write_text(Path(map_html).read_text(encoding="utf-8"), encoding="utf-8")
 
-    # Copy the folium map HTML as a sibling file so an iframe can load it via
-    # a relative src (folium HTML contains quotes/script that break inline srcdoc).
-    with open(map_html) as f:
-        map_src = f.read()
-    os.makedirs(os.path.dirname(out_html) or ".", exist_ok=True)
-    map_path_out = os.path.join(os.path.dirname(out_html) or ".", "map.html")
-    with open(map_path_out, "w") as f:
-        f.write(map_src)
+    percent_cols = {
+        "weighted_demand_fraction", "optimization_demand_fraction",
+        "population_fraction", "land_area_fraction",
+    }
+    if regulations_enabled and regulatory_csv and os.path.exists(regulatory_csv):
+        jurisdiction = html.escape(regulations_jurisdiction or "configured jurisdiction")
+        as_of = html.escape(regulations_as_of or "configured source date")
+        regulatory_section = (
+            "<section><h2>Regulatory screening</h2>"
+            f"<div class='notice'><b>{jurisdiction}</b> · {as_of}<br>"
+            "Planning-screening only: parcel/zoning matches and configured ordinance rules can flag or cap candidates, "
+            "but this dashboard is not a permit or legal determination. Conditional provisions remain manual-review flags.</div>"
+            + _table_html(regulatory_csv, max_rows=250) + "</section>"
+        )
+    else:
+        regulatory_section = ""
 
-    html = _TEMPLATE.format(
-        region=region,
-        k=k_sites,
+    page = _TEMPLATE.format(
+        region=html.escape(region),
         budget=budget,
         l2=l2_walk_time_min,
         dcfc=dcfc_drive_time_min,
-        gamma=gamma,
-        solver=solver,
-        cards=_cards_html(metrics_opt, metrics_greedy),
-        map_iframe=(f'<iframe src="map.html" id="map"></iframe>'),
-        b64_ba=_b64(os.path.join(charts_dir, "before_after_durham.png")),
-        b64_mix=_b64(os.path.join(charts_dir, "budget_mix_durham.png")),
-        b64_equity=_b64(os.path.join(charts_dir, "equity_durham.png")),
-        results_table=_results_html(results_csv),
+        solver=html.escape(str(solver)),
+        routing_backend=html.escape(str(routing_backend)),
+        cards=_cards_html(metrics_opt, metrics_greedy, coverage_csv, regulatory_csv),
+        chart_ba=_chart_html(str(Path(charts_dir) / "before_after.png"), "optimized versus greedy"),
+        chart_mix=_chart_html(str(Path(charts_dir) / "budget_mix.png"), "charger mix"),
+        chart_equity=_chart_html(str(Path(charts_dir) / "equity.png"), "equity profile"),
+        coverage_table=_table_html(coverage_csv, percent_columns=percent_cols),
+        regulatory_section=regulatory_section,
+        results_table=_table_html(results_csv),
     )
-    with open(out_html, "w") as f:
-        f.write(html)
-    return out_html
+    out.write_text(page, encoding="utf-8")
+    return str(out)

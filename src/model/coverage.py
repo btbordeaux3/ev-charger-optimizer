@@ -1,196 +1,258 @@
-"""Build the coverage matrix between candidate sites and demand cells.
+"""Travel-time coverage matrices and isochrone summaries.
 
-Coverage is decided by *travel time*, not distance: a site covers a demand
-cell when the OSM network travel time between them is within the charger
-type's isochrone cap (default 20 minutes):
-
-  - Level 2 (slow) chargers serve local residents, so we use WALKING time:
-    per-edge walk_time = length / walking speed (4.8 km/h default). This is a
-    true pedestrian isochrone over the road network, no detour fudge factor.
-
-  - DC fast chargers serve corridor/commuter traffic, so we use DRIVING time:
-    per-edge drive_time = length / class-based speed (from OSM `highway` tags,
-    e.g. motorway 110 km/h ... residential 30 km/h). This is a driving
-    isochrone in the "20-minute city" sense. Walk-only ways (footways, paths,
-    cycleways) are excluded from the drive graph.
-
-Performance: with a 20-minute drive cap the isochrone spans most of the region,
-so scipy's C-level Dijkstra runs per site (chunked to bound memory) across a
-process pool. `limit` stops label growth past the time cap — exact, same result
-as a cutoff Dijkstra.
+The original project built one hand-made road graph for both walking and
+Driving, treated every road as two-way, and used ``fork`` multiprocessing.
+V2 instead accepts separate OSMnx walk/drive graphs, respects directionality,
+and uses batched SciPy Dijkstra that works identically on Windows and macOS.
+An optional cuGraph backend is available on Linux/WSL2 with RAPIDS installed.
 """
 from __future__ import annotations
 
-import multiprocessing
-import numpy as np
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
 import geopandas as gpd
 import networkx as nx
+import numpy as np
 from scipy.sparse.csgraph import dijkstra
+from scipy.spatial import cKDTree
 
-from src.fetch.network import (
-    add_travel_times,
-    snap_index,
-    project_points_to,
-    WALK_ONLY_CLASSES,
-)
-
-# Per-worker globals set by _worker_init (inherited copy-on-write via fork).
-_WORKER = {}
+log = logging.getLogger(__name__)
 
 
-def _worker_init(csr, demand_node_pos, limit_s, n_demand):
-    _WORKER["csr"] = csr
-    _WORKER["dpos"] = demand_node_pos
-    _WORKER["limit"] = limit_s
-    _WORKER["n_demand"] = n_demand
+@dataclass
+class _PreparedGraph:
+    graph: nx.DiGraph
+    node_list: list
+    pos: dict
+    tree: cKDTree
+    csr: object
+    node_xy: np.ndarray
 
 
-def _chunk_dijkstra(idx: np.ndarray) -> np.ndarray:
-    """Travel times from a chunk of site nodes to all demand cells (seconds)."""
-    dist = dijkstra(_WORKER["csr"], directed=True, indices=idx,
-                    limit=_WORKER["limit"], return_predecessors=False)
-    return np.asarray(dist[:, _WORKER["dpos"]], dtype=np.float64)
+def _prepare_graph(G: nx.DiGraph, direction: str) -> _PreparedGraph:
+    if direction not in {"to_site", "from_site"}:
+        raise ValueError("coverage.direction must be 'to_site' or 'from_site'")
+    R = G.reverse(copy=False) if direction == "to_site" else G
+    nodes = list(R.nodes)
+    if not nodes:
+        raise ValueError("Routing graph has no nodes.")
+    xy = np.array([[float(R.nodes[n]["x"]), float(R.nodes[n]["y"])] for n in nodes])
+    tree = cKDTree(xy)
+    pos = {n: i for i, n in enumerate(nodes)}
+    csr = nx.to_scipy_sparse_array(
+        R,
+        nodelist=nodes,
+        weight="travel_time",
+        format="csr",
+        dtype=np.float64,
+    )
+    return _PreparedGraph(R, nodes, pos, tree, csr, xy)
 
 
-def _drive_weight(u, v, d):
-    """Drive-time edge weight; None drops walk-only ways from the graph."""
-    if d.get("highway") in WALK_ONLY_CLASSES:
-        return None
-    return d["drive_time"]
+def _points_xy(gdf: gpd.GeoDataFrame, crs) -> np.ndarray:
+    if gdf is None or gdf.empty:
+        return np.empty((0, 2), dtype=float)
+    p = gdf.to_crs(crs)
+    geom = p.geometry
+    reps = geom if geom.geom_type.eq("Point").all() else geom.representative_point()
+    return np.column_stack([reps.x.to_numpy(), reps.y.to_numpy()]).astype(float)
+
+
+def _snap_positions(prep: _PreparedGraph, xy: np.ndarray) -> np.ndarray:
+    if len(xy) == 0:
+        return np.empty(0, dtype=np.int64)
+    _dist, idx = prep.tree.query(xy)
+    return np.asarray(idx, dtype=np.int64)
+
+
+def _auto_workers(n: int) -> int:
+    if n and n > 0:
+        return int(n)
+    # Dijkstra chunks can be memory-heavy. Four concurrent C-level calls are a
+    # safer default than spawning every logical core.
+    return max(1, min(4, (os.cpu_count() or 1)))
+
+
+def _can_use_cugraph() -> bool:
+    try:
+        import cudf  # noqa: F401
+        import cugraph  # noqa: F401
+        import cupy as cp
+        return cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
 
 
 class CoverageMatrix:
-    """Isochrone coverage between sites and demand cells per charger type.
-
-    L2 coverage is a walking-time isochrone (`l2_walk_time_min`).
-    DCFC coverage is a driving-time isochrone (`dcfc_drive_time_min`).
-    """
+    """Compute L2-walk and DCFC-drive travel-time coverage."""
 
     def __init__(
         self,
-        G: nx.DiGraph,
+        *,
+        walk_graph: nx.DiGraph,
+        drive_graph: nx.DiGraph,
         sites: gpd.GeoDataFrame,
         demand: gpd.GeoDataFrame,
-        l2_walk_time_min: float = 20.0,
-        dcfc_drive_time_min: float = 20.0,
-        walk_speed_kph: float = 4.8,
-        drive_default_speed_kph: float = 35.0,
+        metric_crs,
+        l2_walk_time_min: float = 10.0,
+        dcfc_drive_time_min: float = 10.0,
         dcfc_min_aadt: float = 0.0,
-        utm_epsg: int = 32617,
-        n_jobs: int = -1,
+        direction: str = "to_site",
+        backend: str = "auto",
+        n_workers: int = 0,
+        chunk_size: int = 24,
     ):
-        self.G = G
-        self.sites = sites
-        self.demand = demand
-        self.l2_walk_time_min = l2_walk_time_min
-        self.dcfc_drive_time_min = dcfc_drive_time_min
-        self.dcfc_min_aadt = dcfc_min_aadt
-        self.utm_epsg = utm_epsg
-        self.n_jobs = multiprocessing.cpu_count() if n_jobs == -1 else n_jobs
+        self.sites = sites.reset_index(drop=True)
+        self.demand = demand.reset_index(drop=True)
+        self.metric_crs = metric_crs
+        self.l2_walk_time_min = float(l2_walk_time_min)
+        self.dcfc_drive_time_min = float(dcfc_drive_time_min)
+        self.dcfc_min_aadt = float(dcfc_min_aadt)
+        self.direction = direction
+        self.n_workers = _auto_workers(n_workers)
+        self.chunk_size = max(1, int(chunk_size))
 
-        self._walk_cutoff_s = l2_walk_time_min * 60.0
-        self._drive_cutoff_s = dcfc_drive_time_min * 60.0
+        self.walk = _prepare_graph(walk_graph, direction)
+        self.drive = _prepare_graph(drive_graph, direction)
 
-        self.site_pts = project_points_to(sites, utm_epsg)
-        self.demand_pts = project_points_to(demand, utm_epsg)
-        self._tree, self._node_list = snap_index(G)
-        self._pos = {n: i for i, n in enumerate(self._node_list)} if self._node_list else {}
+        requested = backend.lower()
+        if requested not in {"auto", "scipy", "cugraph"}:
+            raise ValueError("routing_backend must be auto, scipy, or cugraph")
+        if requested == "cugraph" and not _can_use_cugraph():
+            log.warning("cuGraph requested but unavailable; falling back to SciPy.")
+            requested = "scipy"
+        if requested == "auto":
+            requested = "cugraph" if _can_use_cugraph() else "scipy"
+        self.backend_used = requested
 
-        self._csr = {}
-        if G is not None and G.number_of_edges():
-            add_travel_times(G, walk_speed_kph, drive_default_speed_kph)
-            self._csr["walk_time"] = nx.to_scipy_sparse_array(
-                G, nodelist=self._node_list, weight="walk_time",
-                format="csr", dtype=float)
-            self._csr["drive_time"] = nx.to_scipy_sparse_array(
-                G, nodelist=self._node_list, weight=_drive_weight,
-                format="csr", dtype=float)
+        site_xy = _points_xy(self.sites, metric_crs)
+        demand_xy = _points_xy(self.demand, metric_crs)
+        self._site_pos = {
+            "l2": _snap_positions(self.walk, site_xy),
+            "dcfc": _snap_positions(self.drive, site_xy),
+        }
+        self._demand_pos = {
+            "l2": _snap_positions(self.walk, demand_xy),
+            "dcfc": _snap_positions(self.drive, demand_xy),
+        }
 
-    def _snap_all(self, pts_array):
-        """Snap an array of (x,y) coords to node ids via the KD tree."""
-        if self._tree is None or len(pts_array) == 0:
-            return [None] * len(pts_array)
-        dist, idx = self._tree.query(pts_array)
-        return [self._node_list[int(i)] for i in idx]
+    def _scipy_times(self, mode: str, site_indices, cutoff_s: float) -> np.ndarray:
+        prep = self.walk if mode == "l2" else self.drive
+        spos = self._site_pos[mode][np.asarray(site_indices, dtype=int)]
+        dpos = self._demand_pos[mode]
+        if len(spos) == 0 or len(dpos) == 0:
+            return np.empty((len(spos), len(dpos)), dtype=np.float32)
 
-    def _dist_to_cells(self, site_idx, weight: str, cutoff_s: float,
-                       demand_node_pos, chunk: int = 24) -> np.ndarray:
-        """(n_sites, n_demand) min travel time site->cell within cutoff."""
-        n = len(site_idx)
-        if n == 0 or self._csr.get(weight) is None:
-            return np.full((n, len(self.demand)), np.inf)
-        csr = self._csr[weight]
-        idx = np.asarray(site_idx, dtype=int)
-        chunks = [idx[s:s + chunk] for s in range(0, n, chunk)]
+        # Several candidate points can snap to the same graph node. Compute each
+        # unique source once, then expand back to candidate order.
+        uniq, inverse = np.unique(spos, return_inverse=True)
+        chunks = [uniq[i:i + self.chunk_size] for i in range(0, len(uniq), self.chunk_size)]
 
-        if self.n_jobs <= 1 or len(chunks) <= 1:
-            _worker_init(csr, demand_node_pos, cutoff_s, len(self.demand))
-            parts = [_chunk_dijkstra(c) for c in chunks]
+        def solve(chunk):
+            dist = dijkstra(
+                prep.csr,
+                directed=True,
+                indices=np.asarray(chunk, dtype=int),
+                limit=float(cutoff_s),
+                return_predecessors=False,
+            )
+            dist = np.atleast_2d(np.asarray(dist, dtype=np.float32))
+            return dist[:, dpos]
+
+        if self.n_workers > 1 and len(chunks) > 1:
+            with ThreadPoolExecutor(max_workers=self.n_workers) as ex:
+                parts = list(ex.map(solve, chunks))
         else:
-            ctx = multiprocessing.get_context("fork")
-            with ctx.Pool(processes=self.n_jobs, initializer=_worker_init,
-                          initargs=(csr, demand_node_pos, cutoff_s,
-                                    len(self.demand))) as pool:
-                parts = pool.map(_chunk_dijkstra, chunks, chunksize=1)
-        return np.vstack(parts) if parts else np.full((n, len(self.demand)), np.inf)
+            parts = [solve(c) for c in chunks]
+        uniq_times = np.vstack(parts) if parts else np.empty((0, len(dpos)), dtype=np.float32)
+        return uniq_times[inverse]
+
+    def _cugraph_times(self, mode: str, site_indices, cutoff_s: float) -> np.ndarray:
+        """Optional NVIDIA path. Requires RAPIDS/cuGraph (Linux or WSL2)."""
+        try:
+            import cudf
+            import cugraph
+        except Exception:
+            return self._scipy_times(mode, site_indices, cutoff_s)
+
+        prep = self.walk if mode == "l2" else self.drive
+        spos = self._site_pos[mode][np.asarray(site_indices, dtype=int)]
+        dpos = self._demand_pos[mode]
+        coo = prep.csr.tocoo()
+        edges = cudf.DataFrame({
+            "src": coo.row.astype(np.int32),
+            "dst": coo.col.astype(np.int32),
+            "weight": coo.data.astype(np.float32),
+        })
+        cg = cugraph.Graph(directed=True)
+        cg.from_cudf_edgelist(
+            edges,
+            source="src",
+            destination="dst",
+            edge_attr="weight",
+            renumber=False,
+        )
+
+        out = np.full((len(spos), len(dpos)), np.inf, dtype=np.float32)
+        dpos_arr = np.asarray(dpos, dtype=np.int64)
+        for row, source in enumerate(spos):
+            result = cugraph.sssp(cg, source=int(source))
+            # Current cuGraph returns vertex/distance columns. Convert only the
+            # rows we need; thresholding happens after transfer.
+            pdf = result[["vertex", "distance"]].to_pandas().set_index("vertex")
+            vals = pdf["distance"].reindex(dpos_arr).to_numpy(dtype=np.float32)
+            vals[vals > cutoff_s] = np.inf
+            out[row] = vals
+        return out
+
+    def travel_times(
+        self,
+        mode: str,
+        site_indices=None,
+        *,
+        cutoff_min: float | None = None,
+    ) -> np.ndarray:
+        """Return site -> demand (or demand -> site) time matrix in seconds."""
+        if mode not in {"l2", "dcfc"}:
+            raise ValueError("mode must be l2 or dcfc")
+        if site_indices is None:
+            site_indices = np.arange(len(self.sites), dtype=int)
+        else:
+            site_indices = np.asarray(site_indices, dtype=int)
+        default = self.l2_walk_time_min if mode == "l2" else self.dcfc_drive_time_min
+        cutoff_s = float(cutoff_min if cutoff_min is not None else default) * 60.0
+        if self.backend_used == "cugraph":
+            return self._cugraph_times(mode, site_indices, cutoff_s)
+        return self._scipy_times(mode, site_indices, cutoff_s)
 
     def build(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (A_l2, A_dcfc) boolean coverage matrices.
+        n_sites, n_demand = len(self.sites), len(self.demand)
+        if n_sites == 0 or n_demand == 0:
+            return (
+                np.zeros((n_sites, n_demand), dtype=bool),
+                np.zeros((n_sites, n_demand), dtype=bool),
+            )
 
-        A_l2[s, i]   == True if site s is within ``l2_walk_time_min`` of cell
-                       i by WALKING the OSM network.
-        A_dcfc[s, i] == True if site s is within ``dcfc_drive_time_min`` of
-                       cell i by DRIVING the OSM network AND the cell's traffic
-                       is above ``dcfc_min_aadt`` (corridor-only coverage).
-        """
-        n_sites = len(self.sites)
-        n_demand = len(self.demand)
-        A_l2 = np.zeros((n_sites, n_demand), dtype=bool)
-        A_dcfc = np.zeros((n_sites, n_demand), dtype=bool)
-        if n_sites == 0 or n_demand == 0 or self._tree is None:
-            return A_l2, A_dcfc
+        t_l2 = self.travel_times("l2", cutoff_min=self.l2_walk_time_min)
+        t_dc = self.travel_times("dcfc", cutoff_min=self.dcfc_drive_time_min)
+        A_l2 = np.isfinite(t_l2) & (t_l2 <= self.l2_walk_time_min * 60.0)
+        A_dc = np.isfinite(t_dc) & (t_dc <= self.dcfc_drive_time_min * 60.0)
 
-        demand_nodes = self._snap_all(self._demand_pt_array())
-        site_nodes = self._snap_all(self._site_pt_array())
-        valid_cells = np.array([nd is not None for nd in demand_nodes])
-        demand_node_pos = np.array(
-            [self._pos[nd] for nd in demand_nodes if nd is not None], dtype=int
-        )
-        site_node_pos = [self._pos.get(nd) for nd in site_nodes]
+        if self.dcfc_min_aadt > 0 and "traffic_count" in self.demand.columns:
+            eligible = (
+                self.demand["traffic_count"].to_numpy(dtype=float)
+                >= self.dcfc_min_aadt
+            )
+            A_dc &= eligible[None, :]
+        return A_l2, A_dc
 
-        # dedupe sites sharing a snap node: identical coverage, compute once
-        site_node_uid = {}
-        for si, p in enumerate(site_node_pos):
-            if p is not None:
-                site_node_uid.setdefault(p, []).append(si)
-        unique = list(site_node_uid)
-
-        traffic = (
-            self.demand["traffic_count"].values
-            if "traffic_count" in self.demand.columns
-            else np.zeros(n_demand)
-        )
-        dcfc_eligible = traffic >= self.dcfc_min_aadt
-
-        if demand_node_pos.size and unique:
-            D_walk = self._dist_to_cells(unique, "walk_time", self._walk_cutoff_s,
-                                         demand_node_pos)
-            D_drive = self._dist_to_cells(unique, "drive_time", self._drive_cutoff_s,
-                                          demand_node_pos)
-            for k, p in enumerate(unique):
-                for si in site_node_uid[p]:
-                    A_l2[si, valid_cells] = D_walk[k] <= self._walk_cutoff_s
-                    A_dcfc[si, valid_cells] = (
-                        (D_drive[k] <= self._drive_cutoff_s) & dcfc_eligible[valid_cells]
-                    )
-        return A_l2, A_dcfc
-
-    def _site_pt_array(self):
-        return np.array(
-            [tuple(p.coords[0]) for p in self.site_pts]
-        ) if self.site_pts else np.zeros((0, 2))
-
-    def _demand_pt_array(self):
-        return np.array(
-            [tuple(p.coords[0]) for p in self.demand_pts]
-        ) if self.demand_pts else np.zeros((0, 2))
+    def min_times_for_selected(self, mode: str, site_indices, max_threshold_min: float) -> np.ndarray:
+        """Minimum time from each demand cell to any selected site of a mode."""
+        site_indices = list(site_indices)
+        if not site_indices:
+            return np.full(len(self.demand), np.inf, dtype=np.float32)
+        times = self.travel_times(mode, site_indices, cutoff_min=max_threshold_min)
+        return np.min(times, axis=0) if len(times) else np.full(len(self.demand), np.inf)

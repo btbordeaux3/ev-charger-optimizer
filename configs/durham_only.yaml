@@ -1,4 +1,4 @@
-# Region configuration for Durham County, NC (City+County of Durham).
+# EV Charger Optimizer V3 — Durham County, NC
 name: "Durham County NC"
 
 counties:
@@ -7,31 +7,60 @@ counties:
     county_fips: "063"
     state_abbr: NC
 
+# Prefer putting real keys in .env rather than committing them here.
 nrel_api_key: ""
 census_api_key: ""
-
-municipal_layers: []
-road_network_source: "overpass"
 cache_dir: "data/raw"
+road_network_source: "osmnx"
+municipal_layers: []
+
+# OSM parking candidate eligibility.
+min_parking_m2: 1000
+min_parking_capacity: 20
+candidate_tile_deg: 0.10
+
+# Only routing graphs are buffered beyond the county boundary. Candidate sites
+# and demand cells are clipped to the exact county polygon.
+walk_network_buffer_m: 2500
+drive_network_buffer_m: 8000
 
 demand:
   grid_resolution_m: 400
   alpha_traffic: 1.0
   beta_equity: 1.0
   income_weighted_equity: false
+  traffic_influence_m: 600
 
 coverage:
-  l2_walk_time_min: 20
-  dcfc_drive_time_min: 20
+  # Primary optimization catchments.
+  l2_walk_time_min: 10
+  dcfc_drive_time_min: 10
   walk_speed_kph: 4.8
   drive_default_speed_kph: 35.0
   dcfc_min_aadt: 0.0
+  direction: "to_site"
+
+  # Extra dashboard layers / coverage-summary rows.
+  map_thresholds_min: [5, 10, 15]
+
+  # auto = cuGraph when installed + NVIDIA is usable; otherwise SciPy.
+  routing_backend: "auto"
+  routing_workers: 0
+  routing_chunk_size: 24
 
 optimization:
-  k_sites: 5
+  # These now apply to the PRIMARY budget model (V1 accidentally ignored them).
   min_l2: 2
   min_dcfc: 3
+  min_sites_used: 5
+  max_sites_used: 0
+  min_site_spacing_m: 0
+  coverage_bonus: 0.25
+
+  # Legacy compatibility only.
+  k_sites: 5
   gamma: 0.5
+
   solver: "auto"
   time_limit_s: 120
   mip_gap: 0.01
@@ -42,13 +71,95 @@ budget:
   cost_dcfc: 150000
   cap_l2: 15
   cap_dcfc: 60
-  site_max: 12
+
+  # Absolute cap. Actual per-site cap is usually lower, estimated from parking.
+  site_max: 6
+  parking_spaces_per_charger: 10
+  parking_m2_per_space: 30
+  min_site_max: 1
+
+existing:
+  # Cells already accessible to a current public charger keep this fraction of
+  # their weight, steering new investment toward gaps without banning infill.
+  covered_demand_multiplier: 0.35
+  public_only: true
 
 zoning:
   layers: []
   multifamily_column: ""
   multifamily_values: []
   cell_multiplier: 1.5
+
+
+# Regulatory screening layer. This is intentionally auditable/versioned and is
+# NOT a permit determination. Durham's current UDO has no location-based
+# minimum motor-vehicle parking requirement; the parking schedule is a baseline
+# for location-specific maximums. Certain DD/CD public-parking height provisions
+# require at least 3 EV charging spaces, so those are flagged for manual review
+# rather than incorrectly forced onto every existing parking lot.
+regulations:
+  enabled: true
+  jurisdiction: "Durham City-County UDO"
+  as_of_date: "2026-08-16 electronic UDO check; City last amended 2026-06-15, County 2026-06-22"
+  mode: "advisory"
+
+  # Official Durham public parcel layer. Candidate OSM parking points are
+  # point-in-polygon matched to parcel zoning/use metadata and cached locally.
+  parcel_layer_url: "https://webgis.durhamnc.gov/server/rest/services/PublicWorksServices/DurhamGISReferenceLayers/MapServer/116"
+  parcel_id_field: "REID"
+  address_field: "LOCATION_ADDR"
+  zoning_field: "ZONING"
+  land_class_field: "LAND_CLASS"
+  units_field: "TOTAL_UNITS"
+  floor_area_field: "HEATED_AREA"
+  gla_field: "GROSS_LEASABLE_AREA"
+  request_workers: 6
+
+  # Planning guardrail, not law. The core parking-size rule is still stricter
+  # for many lots (1 charger per ~10 estimated spaces).
+  max_ev_share_existing_spaces: 0.15
+  unknown_context_policy: "allow_with_review"
+
+  rules:
+    - name: "Durham motor-vehicle parking location minimum"
+      zone_regex: ".*"
+      parking_min_fixed: 0
+      applicability: "general"
+      manual_review: false
+      note: "UDO 10.3.1A.4 lists no motor-vehicle parking minimum by location; the use schedule is a baseline for location maximums."
+      source: "Durham UDO 10.3.1A.4"
+
+    - name: "Downtown Design parking maximum"
+      zone_regex: "^DD(?:-|$)"
+      parking_max_factor: 1.0
+      note: "DD maximum is 100% of the use-based parking-rate baseline."
+      source: "Durham UDO 10.3.1A.4"
+
+    - name: "Commercial Infill parking maximum"
+      zone_regex: "^CI(?:-|$)"
+      parking_max_factor: 1.0
+      note: "CI maximum is 100% of the use-based parking-rate baseline."
+      source: "Durham UDO 10.3.1A.4"
+
+    - name: "CSD Core parking maximum"
+      zone_regex: "^CSD-C(?:$|\\b)"
+      parking_max_factor: 0.5
+      note: "CSD-C maximum is 50% of the use-based parking-rate baseline."
+      source: "Durham UDO 10.3.1A.4"
+
+    - name: "CSD Support parking maximum"
+      zone_regex: "^CSD-S[12](?:$|\\b)"
+      parking_max_factor: 1.0
+      note: "CSD-S1 and CSD-S2 maximum is 100% of the use-based parking-rate baseline."
+      source: "Durham UDO 10.3.1A.4"
+
+    - name: "DD/CD conditional public-parking EV provision"
+      zone_regex: "^(?:DD|CD)(?:-|$)"
+      ev_min_installed: 3
+      applicability: "conditional_height_provision_public_parking"
+      manual_review: true
+      note: "Potentially applicable only when the development uses the UDO public-parking provision for additional height; that provision requires at least 3 EV charging spaces. Do not treat this as a blanket existing-lot mandate."
+      source: "Durham UDO 16.3.3C public-parking provisions"
 
 grid:
   enabled: false
@@ -63,4 +174,6 @@ output:
   out_dir: "data/output_durham"
   map_path: "ev_charger_map.html"
   results_path: "recommended_sites.csv"
+  coverage_path: "coverage_summary.csv"
+  regulatory_path: "regulatory_audit.csv"
   charts_dir: "data/output_durham/charts"

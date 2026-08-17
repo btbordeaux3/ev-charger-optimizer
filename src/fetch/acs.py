@@ -31,7 +31,7 @@ from shapely.geometry import Point
 
 import pygris
 
-_YEAR = 2022
+_YEAR = 2024
 
 # Table B25024 uses columns for 1,2,3-4,5-9,10-19,20-49,50+,mobile,boat,other
 _MF_SUFFIXES = ("007", "008", "009", "010")  # 5-9, 10-19, 20-49, 50+
@@ -69,42 +69,50 @@ def fetch_tract_attributes(
     api_key: str | None = None,
     year: int = _YEAR,
 ) -> pd.DataFrame:
-    """Fetch ACS tract attributes for the given counties from the Census API."""
-    key = get_census_key(api_key)
-    # county_fips_list holds full 5-digit FIPS (state+county); strip state part
-    # and join the 3-digit county codes with commas: "state:37 county:063,135"
-    cfips = [f[-3:] for f in county_fips_list]
-    counties = ",".join(cfips)
-    url = f"https://api.census.gov/data/{year}/acs/acs5"
-    params = {
-        "get": "NAME," + ",".join(_ATTRIBUTE_COLS),
-        "for": "tract:*",
-        "in": f"state:{state_fips} county:{counties}",
-        "key": key,
-    }
-    resp = requests.get(url, params=params, timeout=60)
-    if resp.status_code != 200:
-        raise CensusKeyError(
-            f"Census API returned {resp.status_code}: {resp.text[:200]}"
-        )
-    rows = resp.json()
-    header = rows[0]
-    data = rows[1:]
-    df = pd.DataFrame(data, columns=header)
+    """Fetch ACS tract attributes for the requested counties.
 
-    # Build derived equity fields
-    df["geoid"] = (
-        df["state"] + df["county"] + df["tract"]
-    ).astype(str)
+    The Census API is queried one county at a time. This avoids relying on
+    comma-separated county predicates and makes multi-county runs deterministic.
+    """
+    key = get_census_key(api_key)
+    url = f"https://api.census.gov/data/{year}/acs/acs5"
+    frames = []
+    for full_fips in county_fips_list:
+        cf3 = str(full_fips)[-3:].zfill(3)
+        params = {
+            "get": "NAME," + ",".join(_ATTRIBUTE_COLS),
+            "for": "tract:*",
+            "in": f"state:{str(state_fips).zfill(2)} county:{cf3}",
+            "key": key,
+        }
+        resp = requests.get(url, params=params, timeout=60)
+        if resp.status_code != 200:
+            raise CensusKeyError(
+                f"Census API returned {resp.status_code} for county {cf3}: "
+                f"{resp.text[:200]}"
+            )
+        rows = resp.json()
+        if not rows or len(rows) < 2:
+            continue
+        frames.append(pd.DataFrame(rows[1:], columns=rows[0]))
+
+    if not frames:
+        return pd.DataFrame(columns=["geoid", "total_population", "median_income",
+                                     "renter_units", "total_housing_units",
+                                     "multifamily_units", "no_garage_households"])
+    df = pd.concat(frames, ignore_index=True)
+
+    df["geoid"] = (df["state"] + df["county"] + df["tract"]).astype(str)
     df["total_population"] = _to_num(df["B01003_001E"])
     df["median_income"] = _to_num(df["B19013_001E"]).clip(lower=0.0)
     df["renter_units"] = _to_num(df["B25008_003E"])
     df["total_housing_units"] = _to_num(df["B25008_001E"])
-    df["multifamily_units"] = df[
-        ["B25024_" + s + "E" for s in _MF_SUFFIXES]
-    ].apply(
-        lambda r: sum(_to_num(v) for v in r), axis=1
-    )
+    mf_cols = ["B25024_" + suffix + "E" for suffix in _MF_SUFFIXES]
+    df["multifamily_units"] = df[mf_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1)
+
+    # A conservative proxy for households less likely to have dedicated
+    # off-street/home charging. Retain the original project's definition while
+    # fixing how it is spatially allocated downstream.
     df["no_garage_households"] = df["multifamily_units"]
     return df
 
@@ -127,7 +135,7 @@ def fetch_tract_geometries(
                 state=state_fips,
                 county=cf3,
                 year=year,
-                cache=cache_dir is not None,
+                cache=True,
             )
         except TypeError:
             gdf = pygris.tracts(

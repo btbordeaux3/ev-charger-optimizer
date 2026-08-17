@@ -1,229 +1,191 @@
-"""Build a routable road network graph from OSM edge features.
+"""Routing graph construction for walking/driving isochrones.
 
-We assemble a directed networkx graph from raw Overpass "way" geometry so we can
-compute road-network (drive) distances for coverage. This avoids depending on
-osmnx's fragile endpoint handling.
+V2 uses OSMnx to preserve one-way streets, access rules, and the network-type
+filtering that the original raw-Overpass graph lost. Graphs are projected to a
+local metric CRS and cached per region/network type.
 """
 from __future__ import annotations
 
+import hashlib
+import logging
+from pathlib import Path
+
 import geopandas as gpd
 import networkx as nx
-import numpy as np
-from scipy.spatial import cKDTree
-from shapely.geometry import Point
 
-# UTM zones: NC spans 17S (32617) / 17N (32617). We approximate the region with
-# a single local metric CRS passed by the caller for accurate driving lengths.
-_UTM = 32617
+log = logging.getLogger(__name__)
 
-# Assumed network speeds (km/h) by OSM highway class for travel-time coverage.
-# Falls back to DEFAULT_DRIVE_SPEED_KPH for classes not listed or unknown.
-SPEED_KPH_BY_CLASS = {
-    "motorway": 110, "motorway_link": 70,
-    "trunk": 90, "trunk_link": 60,
-    "primary": 60, "primary_link": 45,
-    "secondary": 50, "secondary_link": 40,
-    "tertiary": 40, "tertiary_link": 35,
-    "unclassified": 35, "residential": 30, "living_street": 12,
-    "service": 20, "track": 15, "road": 35,
+
+# Reasonable free-flow fallbacks (km/h) for edges without maxspeed data.
+DEFAULT_HIGHWAY_SPEEDS = {
+    "motorway": 105,
+    "motorway_link": 65,
+    "trunk": 85,
+    "trunk_link": 55,
+    "primary": 55,
+    "primary_link": 40,
+    "secondary": 45,
+    "secondary_link": 35,
+    "tertiary": 35,
+    "tertiary_link": 30,
+    "unclassified": 30,
+    "residential": 25,
+    "living_street": 15,
+    "service": 15,
 }
-# Non-driving ways (walk/cycle only) get a low drive speed so Dijkstra
-# deprioritises them but still allows walk-links in the network.
-WALK_ONLY_CLASSES = {"footway", "path", "pedestrian", "cycleway", "steps",
-                     "corridor", "sidewalk", "crossing"}
-DEFAULT_DRIVE_SPEED_KPH = 35.0
-DEFAULT_WALK_SPEED_KPH = 4.8
 
 
-def _kph_to_mps(kph: float) -> float:
-    return kph / 3.6
+def estimate_metric_crs(region_geom):
+    """Return a local projected CRS suitable for distance/area calculations."""
+    gs = gpd.GeoSeries([region_geom], crs="EPSG:4326")
+    crs = gs.estimate_utm_crs()
+    if crs is None:
+        raise ValueError("Could not estimate a local metric CRS for this region.")
+    return crs
 
 
-def speed_kph_for(highway: str | None,
-                  speed_map: dict | None = None,
-                  default: float = DEFAULT_DRIVE_SPEED_KPH) -> float:
-    """Drive speed (km/h) for an OSM highway class."""
-    if speed_map is not None and highway and highway in speed_map:
-        return float(speed_map[highway])
-    if highway in SPEED_KPH_BY_CLASS:
-        return float(SPEED_KPH_BY_CLASS[highway])
-    if highway in WALK_ONLY_CLASSES:
-        return DEFAULT_WALK_SPEED_KPH
-    return float(default)
+def region_cache_key(region_name: str, region_geom) -> str:
+    """Stable short key so one region never silently reuses another's cache."""
+    digest = hashlib.sha1(region_geom.wkb).hexdigest()[:10]
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in region_name)
+    slug = "-".join(filter(None, slug.split("-")))[:48] or "region"
+    return f"{slug}-{digest}"
 
 
-def build_graph(edges: gpd.GeoDataFrame,
-                utm_epsg: int = _UTM,
-                walk_speed_kph: float = DEFAULT_WALK_SPEED_KPH) -> nx.DiGraph:
-    """Build a directed graph from a GeoDataFrame of LineString edges.
+def _buffer_polygon(region_geom, metric_crs, buffer_m: float):
+    gs = gpd.GeoSeries([region_geom], crs="EPSG:4326").to_crs(metric_crs)
+    geom = gs.iloc[0].buffer(float(buffer_m))
+    return gpd.GeoSeries([geom], crs=metric_crs).to_crs("EPSG:4326").iloc[0]
 
-    Vertices are de-duplicated by ~0.0001 m grid. Both directions are added.
-    Edge 'length' is metric distance; nodes store x/y in projected CRS.
-    If the input has a 'highway' column the class is kept per edge and per-edge
-    'walk_time' / 'drive_time' (seconds) are added for travel-time coverage.
+
+def _cache_path(cache_dir: str | Path, namespace: str, mode: str, buffer_m: float) -> Path:
+    root = Path(cache_dir) / namespace
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{mode}_network_buffer-{int(round(buffer_m))}m.graphml"
+
+
+def fetch_routing_graph(
+    region_geom,
+    *,
+    mode: str,
+    metric_crs,
+    cache_dir: str | Path,
+    namespace: str,
+    buffer_m: float,
+    walk_speed_kph: float = 4.8,
+    drive_default_speed_kph: float = 35.0,
+    force_refresh: bool = False,
+):
+    """Fetch/cache a projected OSMnx routing graph.
+
+    ``mode`` is ``walk`` or ``drive``. The exact study boundary is buffered only
+    for routing. Candidate sites and demand cells remain clipped to the region.
     """
-    G = nx.DiGraph()
-    if edges.empty:
-        return G
+    if mode not in {"walk", "drive"}:
+        raise ValueError("mode must be 'walk' or 'drive'")
 
-    proj = edges.to_crs(utm_epsg) if edges.crs and edges.crs != utm_epsg else edges
-    has_class = "highway" in proj.columns
-    walk_mps = _kph_to_mps(walk_speed_kph)
-    node_ids: dict[tuple, int] = {}
-    next_id = 0
+    try:
+        import osmnx as ox
+    except ImportError as e:  # pragma: no cover - user environment issue
+        raise RuntimeError(
+            "OSMnx is required for routing. Install requirements.txt first."
+        ) from e
 
-    def _gid(x, y):
-        nonlocal next_id
-        key = (round(x, 1), round(y, 1))
-        if key in node_ids:
-            return node_ids[key]
-        nid = next_id
-        next_id += 1
-        node_ids[key] = nid
-        G.add_node(nid, x=x, y=y)
-        return nid
+    path = _cache_path(cache_dir, namespace, mode, buffer_m)
+    if path.exists() and not force_refresh:
+        log.info("Loading cached %s graph: %s", mode, path)
+        # OSMnx GraphML I/O is defined for MultiDiGraph objects. Keep the
+        # cached representation in that native form, then collapse parallel
+        # edges in memory for the SciPy routing matrix.
+        G_cached = ox.io.load_graphml(path)
+        return ox.convert.to_digraph(G_cached, weight="travel_time")
 
-    for _, row in proj.iterrows():
-        geom = row.geometry
-        if geom is None or geom.geom_type != "LineString":
-            continue
-        hw = str(row.get("highway", "") or "") if has_class else None
-        drive_speed_mps = _kph_to_mps(speed_kph_for(hw))
-        coords = list(geom.coords)
-        for i in range(len(coords) - 1):
-            (x1, y1), (x2, y2) = coords[i], coords[i + 1]
-            u = _gid(x1, y1)
-            v = _gid(x2, y2)
-            length = float(np.hypot(x2 - x1, y2 - y1))
-            if length <= 0:
-                continue
-            attrs = {"length": length, "walk_time": length / walk_mps,
-                     "drive_time": length / drive_speed_mps}
-            if hw:
-                attrs["highway"] = hw
-            G.add_edge(u, v, **attrs)
-            G.add_edge(v, u, **attrs)
-    return G
+    polygon = _buffer_polygon(region_geom, metric_crs, buffer_m)
+    log.info("Fetching OSM %s graph (buffer %.0f m)", mode, buffer_m)
 
+    # OSMnx keeps its own request cache too, which reduces pressure on Overpass.
+    ox.settings.use_cache = True
+    ox.settings.cache_folder = str(Path(cache_dir) / "osmnx_http_cache")
+    ox.settings.log_console = False
 
-def add_travel_times(G: nx.DiGraph,
-                     walk_speed_kph: float = DEFAULT_WALK_SPEED_KPH,
-                     default_speed_kph: float = DEFAULT_DRIVE_SPEED_KPH,
-                     speed_map: dict | None = None) -> None:
-    """Ensure every edge carries 'walk_time' and 'drive_time' (seconds).
+    G = ox.graph.graph_from_polygon(
+        polygon,
+        network_type=mode,
+        simplify=True,
+        retain_all=True,
+        truncate_by_edge=True,
+    )
 
-    For graphs built without travel times (e.g. cached old graphs with only
-    'length'), fills them in from the edge length and class-based speeds.
-    """
-    walk_mps = _kph_to_mps(walk_speed_kph)
-    for u, v, d in G.edges(data=True):
-        if "walk_time" not in d:
-            d["walk_time"] = d["length"] / walk_mps
-        if "drive_time" not in d:
-            drive_mps = _kph_to_mps(
-                speed_kph_for(d.get("highway"), speed_map, default_speed_kph))
-            d["drive_time"] = d["length"] / drive_mps
+    if mode == "drive":
+        # Prefer posted OSM maxspeed values; fill missing values by road class.
+        hwy = dict(DEFAULT_HIGHWAY_SPEEDS)
+        fallback = float(drive_default_speed_kph)
+        G = ox.routing.add_edge_speeds(G, hwy_speeds=hwy, fallback=fallback)
+        G = ox.routing.add_edge_travel_times(G)
+    else:
+        walk_mps = float(walk_speed_kph) / 3.6
+        for _u, _v, _k, data in G.edges(keys=True, data=True):
+            length = float(data.get("length", 0.0) or 0.0)
+            data["travel_time"] = length / walk_mps if walk_mps > 0 else float("inf")
 
+    # Project after OSMnx has calculated length/speed/travel_time. The graph's
+    # x/y are then in meters, which makes nearest-node snapping consistent with
+    # candidate and demand geometries.
+    G = ox.projection.project_graph(G, to_crs=metric_crs)
 
-def max_drive_speed_mps(G: nx.DiGraph,
-                        default_kph: float = DEFAULT_DRIVE_SPEED_KPH) -> float:
-    """Fastest drive speed present on any edge (m/s); safe euclid bound."""
-    best = _kph_to_mps(default_kph)
-    for _u, _v, d in G.edges(data=True):
-        s = d.get("drive_speed_mps")
-        if s is not None:
-            best = max(best, float(s))
-        elif "highway" in d:
-            best = max(best, _kph_to_mps(speed_kph_for(d["highway"])))
-    return best
+    # Persist the projected OSMnx graph in its native MultiDiGraph form.
+    # ox.io.save_graphml expects a MultiDiGraph and will fail on a plain
+    # nx.DiGraph (NetworkX's OutEdgeView has no ``keys`` argument).
+    ox.io.save_graphml(G, filepath=path)
+
+    # scipy.sparse on a MultiDiGraph would sum parallel-edge weights. Collapse
+    # parallel edges by MINIMUM travel time only for the in-memory routing
+    # representation. This preserves the fastest parallel edge between nodes.
+    D = ox.convert.to_digraph(G, weight="travel_time")
+    D.graph.update(G.graph)
+    return D
 
 
-def snap_index(G: nx.DiGraph):
-    """Return a cKDTree over node coordinates plus the node list."""
-    if not G.nodes:
-        return None, None
-    coords = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes])
-    return cKDTree(coords), list(G.nodes)
+def fetch_routing_graphs(
+    region_geom,
+    *,
+    metric_crs,
+    cache_dir: str | Path,
+    namespace: str,
+    walk_buffer_m: float,
+    drive_buffer_m: float,
+    walk_speed_kph: float,
+    drive_default_speed_kph: float,
+    force_refresh: bool = False,
+) -> tuple[nx.DiGraph, nx.DiGraph]:
+    walk = fetch_routing_graph(
+        region_geom,
+        mode="walk",
+        metric_crs=metric_crs,
+        cache_dir=cache_dir,
+        namespace=namespace,
+        buffer_m=walk_buffer_m,
+        walk_speed_kph=walk_speed_kph,
+        drive_default_speed_kph=drive_default_speed_kph,
+        force_refresh=force_refresh,
+    )
+    drive = fetch_routing_graph(
+        region_geom,
+        mode="drive",
+        metric_crs=metric_crs,
+        cache_dir=cache_dir,
+        namespace=namespace,
+        buffer_m=drive_buffer_m,
+        walk_speed_kph=walk_speed_kph,
+        drive_default_speed_kph=drive_default_speed_kph,
+        force_refresh=force_refresh,
+    )
+    return walk, drive
 
 
-def snap_points(tree, node_list, points, crs=_UTM) -> list[int | None]:
-    """Snap (epsg:4326 or projected) points to nearest graph node ids."""
-    if tree is None or not node_list:
-        return [None] * len(points)
-    ids = []
-    for p in points:
-        if p is None:
-            ids.append(None)
-            continue
-        # assume points already in graph CRS
-        d, idx = tree.query([p.x, p.y])
-        ids.append(node_list[int(idx)])
-    return ids
-
-
-def project_points_to(gdf: gpd.GeoDataFrame, utm_epsg: int = _UTM):
-    """Return representative (centroid) coordinates in projected CRS.
-
-    Works for Point or Polygon geometries (demand cells are polygons).
-    """
-    if gdf is None or gdf.empty:
-        return []
-    proj = gdf.to_crs(utm_epsg) if gdf.crs != utm_epsg else gdf
-    pts = []
-    for g in proj.geometry:
-        if g is None:
-            pts.append(None)
-        elif g.geom_type == "Point":
-            pts.append(Point(g.x, g.y))
-        else:
-            c = g.centroid
-            pts.append(Point(c.x, c.y))
-    return pts
-
-
-def road_distance_matrix(
-    G: nx.DiGraph,
-    source_points: list[tuple],
-    target_points: list[tuple],
-    tree,
-    node_list,
-    max_dist_m: float,
-    weight: str = "length",
-) -> np.ndarray:
-    """Compute a boolean coverage matrix between sources and targets.
-
-    For each source (a candidate site), find which targets are within
-    max_dist_m by road. Returns a (len(sources) x len(targets)) bool array.
-
-    This is an optimization: run single-source Dijkstra per source, but only on
-    the pre-filtered set of targets within max_dist_m (set by tree + euclid).
-    """
-    n_src, n_tgt = len(source_points), len(target_points)
-    cov = np.zeros((n_src, n_tgt), dtype=bool)
-    if tree is None or node_list is None:
-        return cov
-
-    for si, src in enumerate(source_points):
-        src_node = node_list[int(tree.query([src[0], src[1]])[1])]
-        # Candidate target indices within euclidean max_dist (upper bound)
-        # Query returns (dists, idx) of points within distance r
-        eucl_dists, eucl_idx = tree.query([src[0], src[1]],
-                                          k=len(node_list),
-                                          distance_upper_bound=max_dist_m)
-        reachable_nodes = set()
-        for d, ni in zip(eucl_dists, eucl_idx):
-            if ni >= len(node_list):
-                continue
-            if d <= max_dist_m:
-                reachable_nodes.add(node_list[int(ni)])
-        if not reachable_nodes:
-            continue
-        # Single-source Dijkstra from src_node, bounded by max_dist
-        lengths = nx.single_source_dijkstra_path_length(
-            G, src_node, cutoff=max_dist_m, weight=weight
-        )
-        for ti, tgt in enumerate(target_points):
-            tgt_node = node_list[int(tree.query([tgt[0], tgt[1]])[1])]
-            if lengths.get(tgt_node, float("inf")) <= max_dist_m:
-                cov[si, ti] = True
-    return cov
+def graph_summary(G: nx.DiGraph) -> dict:
+    return {
+        "nodes": int(G.number_of_nodes()),
+        "edges": int(G.number_of_edges()),
+        "crs": str(G.graph.get("crs", "")),
+    }

@@ -1,58 +1,55 @@
-"""Visualization: interactive folium map + matplotlib comparison charts.
-
-The map shows demand (chloropleth/heat) with the recommended sites overlaid.
-The charts quantify the before/after story:
-  - recommended vs greedy coverage fraction (bar)
-  - gamma sensitivity: how much spreading sites out costs in raw coverage
-"""
+"""Interactive map and comparison charts for V3."""
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+import html
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from shapely.geometry import mapping
 
 
 def _site_points(
     sites: gpd.GeoDataFrame,
     site_types: list[tuple[int, str]] | list[tuple[int, str, int]],
 ) -> gpd.GeoDataFrame:
-    """Return the recommended sites as a GeoDataFrame.
-
-    Accepts either ``[(j, 'l2'), ...]`` (one charger per site) or
-    ``[(j, 'l2', n), ...]`` (cluster model: n chargers at site j). A site with
-    multiple chargers gets one row per charger, tagged with a count for display.
-    """
-    cols = ["name", "charger_type", "charger_count", "geometry"]
+    """Expand selected (site,type,count) tuples while preserving site metadata."""
     if not site_types:
-        return gpd.GeoDataFrame(geometry=[],
-                                columns=cols,
-                                crs=sites.crs if sites.crs else None)
+        return gpd.GeoDataFrame(
+            {"site_index": [], "charger_type": [], "charger_count": []},
+            geometry=gpd.GeoSeries([], crs=sites.crs),
+            crs=sites.crs,
+        )
     rows = []
     for entry in site_types:
-        j, t = entry[0], entry[1]
-        n = entry[2] if len(entry) > 2 else 1
-        rows.append((sites.iloc[j]["name"] if "name" in sites.columns else "",
-                     t, n, sites.iloc[j].geometry))
-    gdf = gpd.GeoDataFrame(rows, columns=cols, crs=sites.crs if sites.crs else None)
-    return gdf
+        j, typ = int(entry[0]), str(entry[1])
+        count = int(entry[2]) if len(entry) > 2 else 1
+        source = sites.iloc[j]
+        row = {k: v for k, v in source.items() if k != "geometry"}
+        row.update({
+            "site_index": j,
+            "charger_type": typ,
+            "charger_count": count,
+            "geometry": source.geometry,
+        })
+        rows.append(row)
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=sites.crs).reset_index(drop=True)
 
 
-def _budget_metrics_or(metrics: dict) -> dict:
-    """Return metrics dict; if the budget-style keys are absent, synthesize them
-    so both MCLP and budget pipelines render the same charts."""
-    if "demand_units_served" in metrics:
-        return metrics
-    total = metrics.get("weight_covered", 0.0)
-    return {
-        "demand_units_served": total,
-        "frac_demand_served": metrics.get("frac_weight_covered", 0.0),
-        "budget_spent": None,
-        "n_chargers_total": metrics.get("n_sites", 0),
-        "n_sites_used": metrics.get("n_sites", 0),
-        "chargers_by_type": metrics.get("chargers_by_type", {}),
-        "n_demand": metrics.get("n_demand", 0),
-    }
+def _center(region_geom):
+    gs = gpd.GeoSeries([region_geom], crs="EPSG:4326").to_crs("EPSG:3857")
+    pt = gpd.GeoSeries(gs.centroid, crs="EPSG:3857").to_crs("EPSG:4326").iloc[0]
+    return [float(pt.y), float(pt.x)]
+
+
+def _fmt(v, decimals=0):
+    try:
+        if pd.isna(v):
+            return "n/a"
+        return f"{float(v):,.{decimals}f}"
+    except Exception:
+        return html.escape(str(v))
 
 
 def folium_map(
@@ -60,80 +57,161 @@ def folium_map(
     demand: gpd.GeoDataFrame,
     sites: gpd.GeoDataFrame,
     recommended_sites: gpd.GeoDataFrame,
+    *,
+    region_geom,
     existing: gpd.GeoDataFrame | None = None,
+    service_layers: dict[str, object] | None = None,
     save_path: str | None = None,
 ) -> object:
-    """Build an interactive folium map of demand + recommended charger sites.
+    """Build a Cities-Skylines-like accessibility map.
 
-    demand           : cells with a 'demand' weight column
-    recommended_sites: selected sites with 'charger_type' in {l2, dcfc}
-    existing         : existing public chargers (optional, from NREL)
+    The service polygons are unions of demand-grid cells reachable within each
+    network-time threshold. They are deliberately labeled as service areas,
+    rather than pretending the cell union is a continuous exact isochrone.
     """
     import folium
     from folium.plugins import MarkerCluster
 
-    c = demand.geometry.to_crs(4326).unary_union.centroid
-    m = folium.Map(location=[c.y, c.x], zoom_start=11)
+    m = folium.Map(location=_center(region_geom), zoom_start=11, tiles="CartoDB positron")
 
-    # Demand layer: color cells by weight
-    norm_demand = demand["demand"].values
-    vmin, vmax = float(np.nanmin(norm_demand)), float(np.nanmax(norm_demand))
-    if not (np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin):
-        vmin, vmax = 0.0, 1.0
+    folium.GeoJson(
+        mapping(region_geom),
+        name="Study boundary",
+        style_function=lambda _f: {"color": "#111827", "weight": 3, "fillOpacity": 0.0},
+        show=True,
+    ).add_to(m)
 
-    def _color(v):
-        frac = (v - vmin) / (vmax - vmin)
-        # blue -> red
-        r = int(255 * frac)
-        b = int(255 * (1 - frac))
-        return f"#{r:02x}00{b:02x}"
+    # Accessibility/service-area layers. Show combined 10-minute coverage by
+    # default; all other thresholds remain one click away in LayerControl.
+    layer_colors = {"l2_walk": "#2563eb", "dcfc_drive": "#ef4444", "either": "#16a34a"}
+    service_layers = service_layers or {}
+    for key, geom in sorted(service_layers.items(), key=lambda kv: kv[0]):
+        mode, t = key.split("|", 1)
+        label = {
+            "l2_walk": f"L2 walk service ≤ {t} min",
+            "dcfc_drive": f"DCFC drive service ≤ {t} min",
+            "either": f"Combined service ≤ {t} min",
+        }.get(mode, f"{mode} ≤ {t} min")
+        show = mode == "either" and abs(float(t) - 10.0) < 1e-9
+        fg = folium.FeatureGroup(name=label, show=show)
+        folium.GeoJson(
+            mapping(geom),
+            style_function=lambda _f, c=layer_colors.get(mode, "#16a34a"): {
+                "color": c, "weight": 1, "fillColor": c, "fillOpacity": 0.20
+            },
+        ).add_to(fg)
+        fg.add_to(m)
 
-    for _, row in demand.iterrows():
-        c = row.geometry.centroid.coords[0]
-        folium.Rectangle(
-            bounds=[(row.geometry.bounds[1], row.geometry.bounds[0]),
-                    (row.geometry.bounds[3], row.geometry.bounds[2])],
-            color=_color(row["demand"]),
-            fill=True, fill_opacity=0.45, weight=0,
-            tooltip=f"demand={row['demand']:.3f}",
-        ).add_to(m)
+    # Demand cells are useful diagnostically but visually noisy, so off by default.
+    demand_fg = folium.FeatureGroup(name="Weighted demand grid", show=False)
+    if not demand.empty and "demand" in demand.columns:
+        vals = pd.to_numeric(demand["demand"], errors="coerce").fillna(0).to_numpy(float)
+        vmax = max(float(np.nanmax(vals)) if len(vals) else 0.0, 1e-9)
+        for _, row in demand.to_crs("EPSG:4326").iterrows():
+            frac = max(0.0, min(1.0, float(row.get("demand", 0.0)) / vmax))
+            opacity = 0.08 + 0.52 * frac
+            popup = (
+                f"Demand: {_fmt(row.get('demand', 0), 3)}<br>"
+                f"Traffic score: {_fmt(row.get('traffic_norm', 0), 3)}<br>"
+                f"Equity score: {_fmt(row.get('equity_norm', 0), 3)}<br>"
+                f"Existing-served: {bool(row.get('already_served_existing', False))}"
+            )
+            folium.GeoJson(
+                mapping(row.geometry),
+                style_function=lambda _f, op=opacity: {
+                    "color": "#7c3aed", "weight": 0.25,
+                    "fillColor": "#7c3aed", "fillOpacity": op,
+                },
+                tooltip=popup,
+            ).add_to(demand_fg)
+    demand_fg.add_to(m)
 
-    # Recommended sites (a site can host a cluster: multiple chargers)
-    for _, r in recommended_sites.iterrows():
-        lon, lat = r.geometry.x, r.geometry.y
-        kind = r["charger_type"]
-        count = int(r.get("charger_count", 1) or 1)
-        color = "#1a9850" if kind == "l2" else "#d73027"
-        icon = "plug" if kind == "l2" else "flash"
-        name = r.get("name", "site")
-        popup = f"{name}<br>{count} x {kind}"
-        folium.Marker(
-            [lat, lon],
-            icon=folium.DivIcon(html=(
-                f"<div style='position:relative;width:26px;height:26px;"
-                f"border-radius:50%;background:{color};color:white;"
-                f"text-align:center;line-height:26px;font-weight:bold;"
-                f"font-size:12px;border:2px solid #fff'>"
-                f"{count}</div>")),
-            popup=popup,
-        ).add_to(m)
+    # Candidate sites: visible for debugging the exact-boundary fix.
+    cand_fg = folium.FeatureGroup(name="Parking candidates (post-screening)", show=False)
+    for idx, r in sites.to_crs("EPSG:4326").iterrows():
+        reg_status = str(r.get("regulatory_status", "not configured") or "not configured")
+        zoning = str(r.get("zoning_code", "") or "n/a")
+        popup = (
+            f"Candidate #{idx}<br>{html.escape(str(r.get('name', '') or 'unnamed parking'))}<br>"
+            f"Estimated spaces: {_fmt(r.get('estimated_spaces', 0))}<br>"
+            f"Physical cap: {_fmt(r.get('site_max_pre_regulation', r.get('site_max', 0)))}<br>"
+            f"Final site cap: {_fmt(r.get('site_max', 0))}<br>"
+            f"Zoning: {html.escape(zoning)}<br>"
+            f"Regulatory status: {html.escape(reg_status)}"
+        )
+        color = "#9ca3af" if int(r.get("site_max", 0) or 0) > 0 else "#dc2626"
+        folium.CircleMarker(
+            [r.geometry.y, r.geometry.x], radius=2.5, color=color,
+            fill=True, fill_opacity=0.55, weight=1, popup=popup,
+        ).add_to(cand_fg)
+    cand_fg.add_to(m)
 
-    # Existing chargers (smaller, semi-transparent)
-    if existing is not None and not existing.empty:
-        ec = MarkerCluster(name="Existing chargers")
-        for _, r in existing.iterrows():
+    if "reg_manual_review" in sites.columns:
+        review_fg = folium.FeatureGroup(name="Regulatory manual-review candidates", show=False)
+        for idx, r in sites.to_crs("EPSG:4326").iterrows():
+            if not bool(r.get("reg_manual_review", False)):
+                continue
+            popup = (
+                f"Candidate #{idx}<br>Zoning: {html.escape(str(r.get('zoning_code', '') or 'n/a'))}<br>"
+                f"Rules: {html.escape(str(r.get('reg_rule_names', '') or 'n/a'))}<br>"
+                f"Notes: {html.escape(str(r.get('reg_notes', '') or 'manual review required'))}"
+            )
             folium.CircleMarker(
-                [r.geometry.y, r.geometry.x], radius=3,
-                color="gray", fill=True, fill_opacity=0.5,
-                popup=r.get("name", "existing"),
+                [r.geometry.y, r.geometry.x], radius=5, color="#d97706",
+                fill=True, fill_color="#f59e0b", fill_opacity=0.45, weight=2, popup=popup,
+            ).add_to(review_fg)
+        review_fg.add_to(m)
+
+    # Recommended sites are grouped by physical site so L2+DCFC at one parking
+    # facility do not create overlapping markers.
+    rec_fg = folium.FeatureGroup(name="Recommended sites", show=True)
+    if recommended_sites is not None and not recommended_sites.empty:
+        rec = recommended_sites.to_crs("EPSG:4326")
+        for site_idx, group in rec.groupby("site_index", sort=True):
+            first = group.iloc[0]
+            l2 = int(group.loc[group["charger_type"] == "l2", "charger_count"].sum())
+            dc = int(group.loc[group["charger_type"] == "dcfc", "charger_count"].sum())
+            total = l2 + dc
+            name = str(first.get("name", "") or f"Candidate #{site_idx}")
+            popup = (
+                f"<b>{html.escape(name)}</b><br>Candidate #{site_idx}<br>"
+                f"Level 2: {l2}<br>DC fast: {dc}<br>Total chargers: {total}<br>"
+                f"Estimated parking spaces: {_fmt(first.get('estimated_spaces', 0))}<br>"
+                f"Site cap: {_fmt(first.get('site_max', 0))}<br>"
+                f"Zoning: {html.escape(str(first.get('zoning_code', '') or 'n/a'))}<br>"
+                f"Regulatory status: {html.escape(str(first.get('regulatory_status', '') or 'not configured'))}"
+            )
+            folium.Marker(
+                [first.geometry.y, first.geometry.x],
+                icon=folium.DivIcon(html=(
+                    "<div style='width:30px;height:30px;border-radius:50%;"
+                    "background:#111827;color:white;border:3px solid #facc15;"
+                    "text-align:center;line-height:24px;font-weight:800;font-size:12px;"
+                    "box-shadow:0 1px 4px rgba(0,0,0,.35)'>"
+                    f"{total}</div>"
+                )),
+                popup=popup,
+                tooltip=f"{name}: {total} charger(s)",
+            ).add_to(rec_fg)
+    rec_fg.add_to(m)
+
+    if existing is not None and not existing.empty:
+        ec = MarkerCluster(name="Existing public chargers", show=False)
+        for _, r in existing.to_crs("EPSG:4326").iterrows():
+            label = r.get("station_name", r.get("name", "existing charger"))
+            l2 = int(r.get("ev_level2_evse_num", 0) or 0)
+            dc = int(r.get("ev_dc_fast_num", 0) or 0)
+            folium.CircleMarker(
+                [r.geometry.y, r.geometry.x], radius=3, color="#374151",
+                fill=True, fill_opacity=0.55,
+                popup=f"{html.escape(str(label))}<br>L2: {l2}<br>DCFC: {dc}",
             ).add_to(ec)
         ec.add_to(m)
 
-    folium.LayerControl().add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     if save_path:
         m.save(save_path)
     return m
-
 
 def compare_charts(
     metrics_optimized: dict,

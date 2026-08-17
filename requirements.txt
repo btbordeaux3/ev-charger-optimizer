@@ -1,15 +1,23 @@
-geopandas>=0.13
-osmnx>=1.8
+# Cross-platform core (Windows, macOS, Linux)
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+networkx>=3.2
+geopandas>=1.0
 shapely>=2.0
-pyproj>=3.5
-pygris>=0.3
-gurobipy>=10
-pulp>=2.7
-folium>=0.15
-matplotlib>=3.7
+pyproj>=3.6
+pygris>=0.2.1
+osmnx>=2.1,<3
+
+# Data/API + config
 requests>=2.31
 python-dotenv>=1.0
 pyyaml>=6.0
 tqdm>=4.66
-pandas>=2.0
-numpy>=1.24
+
+# Optimization: open-source default/fallback
+pulp>=2.8
+
+# Outputs
+folium>=0.16
+matplotlib>=3.8

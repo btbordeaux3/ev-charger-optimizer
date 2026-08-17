@@ -1,9 +1,11 @@
-"""Region configuration - the plug-and-play entry point.
+"""Configuration for the plug-and-play EV charger optimizer.
 
-Users define a region (one or more counties / states) in a config file and the
-entire pipeline adapts. A region is identified by county FIPS codes, which drive
-every data source (NREL filtering, NCDOT spatial query, Census tracts, municipal
-sites, and the OSM network we use for road-network distances).
+Version 3 keeps the original top-level YAML layout, but fixes several hidden
+assumptions in v1:
+- metric CRS is chosen per region instead of hard-coding North Carolina's UTM
+- routing and candidate-site cache paths are region-specific
+- budget-model spread/type constraints are configurable and actually enforced
+- isochrone map thresholds and routing backend are configurable
 """
 from __future__ import annotations
 
@@ -13,24 +15,6 @@ from typing import Optional
 import yaml
 
 
-@dataclass
-class County:
-    """A single county that makes up part of the study region."""
-    name: str
-    state_fips: str
-    county_fips: str
-    state_abbr: Optional[str] = None
-
-    @property
-    def fips(self) -> str:
-        """Full 5-digit FIPS code (state + county)."""
-        return self.state_fips + self.county_fips
-
-    def abbr(self) -> str:
-        return self.state_abbr or _STATE_ABBR.get(self.state_fips, "US")
-
-
-# FIPS state_code -> USPS abbreviation (for OSM/NREL queries)
 _STATE_ABBR = {
     "37": "NC",
     "01": "AL", "04": "AZ", "05": "AR", "06": "CA", "08": "CO",
@@ -47,23 +31,38 @@ _STATE_ABBR = {
 
 
 @dataclass
+class County:
+    name: str
+    state_fips: str
+    county_fips: str
+    state_abbr: Optional[str] = None
+
+    @property
+    def fips(self) -> str:
+        return self.state_fips.zfill(2) + self.county_fips.zfill(3)
+
+    def abbr(self) -> str:
+        return self.state_abbr or _STATE_ABBR.get(self.state_fips.zfill(2), "US")
+
+
+@dataclass
 class FetcherConfig:
     nrel_api_key: Optional[str] = None
     census_api_key: Optional[str] = None
-    # Municipal open-data portals (ArcGIS Hub / Socrata / OpenDataSoft feature
-    # service URLs). Each entry is a layer describing candidate sites that a
-    # government body could host a charger on (parking decks, park-and-rides,
-    # libraries, community centers, owned parcels, ...).
     municipal_layers: list[dict] = field(default_factory=list)
-    road_network_source: str = "osmnx"  # only "osmnx" supported for now
+    road_network_source: str = "osmnx"
     cache_dir: str = "data/raw"
-    # Parking-focused candidate sites: only keep OSM parking ways at least this
-    # large (m^2) or parking nodes declaring at least this many spaces.
+
+    # Candidate parking filters.
     min_parking_m2: float = 1000.0
     min_parking_capacity: int = 20
-    # Tile size (degrees) for the parking-site Overpass queries. Smaller tiles
-    # = smaller/safer queries but more of them; 0.1 is a good balance.
     candidate_tile_deg: float = 0.1
+
+    # Routing graph buffers. Demand/candidates are clipped to the exact county
+    # polygon; only the network gets a buffer so legitimate paths may leave and
+    # re-enter the study boundary.
+    walk_network_buffer_m: float = 2500.0
+    drive_network_buffer_m: float = 8000.0
 
     @property
     def has_nrel_key(self) -> bool:
@@ -72,104 +71,148 @@ class FetcherConfig:
 
 @dataclass
 class DemandConfig:
-    # Demand grid resolution in meters (edge length of each cell)
     grid_resolution_m: int = 400
-    # Weights: alpha scales traffic (AADT) demand, beta scales equity demand.
     alpha_traffic: float = 1.0
     beta_equity: float = 1.0
-    # Equity is measured as count of multifamily/renter households. If
-    # income_weighted is True, multiply by a low-income factor so poorer
-    # tracts get priority.
     income_weighted_equity: bool = False
+    # Metric smoothing radius around each grid cell center for AADT stations.
+    traffic_influence_m: float = 600.0
 
 
 @dataclass
 class CoverageConfig:
-    """Coverage isochrones by charger type (travel time, not distance).
+    """Network-time accessibility assumptions.
 
-    Level 2 (slow) chargers serve local residents, so coverage is a WALKING-
-    TIME isochrone: OSM network travel time at ``walk_speed_kph``.
-    DC fast chargers serve corridor/commuter traffic, so coverage is a
-    DRIVING-TIME isochrone: OSM network travel time using per-road-class
-    speeds derived from the OSM ``highway`` tag.
+    Level 2 is modeled as walking access to a charger. DC fast is modeled as
+    driving access to a charger. ``direction='to_site'`` means the route is
+    demand -> charger, which respects one-way streets correctly.
     """
-    l2_walk_time_min: float = 20.0       # Level 2 walking isochrone cap (min)
-    dcfc_drive_time_min: float = 20.0    # DC fast driving isochrone cap (min)
-    walk_speed_kph: float = 4.8          # assumed walking speed (km/h)
-    drive_default_speed_kph: float = 35.0  # fallback drive speed (km/h)
-    dcfc_min_aadt: float = 0.0           # only allow DCFC coverage of cells above this AADT
+
+    l2_walk_time_min: float = 10.0
+    dcfc_drive_time_min: float = 10.0
+    walk_speed_kph: float = 4.8
+    drive_default_speed_kph: float = 35.0
+    dcfc_min_aadt: float = 0.0
+    direction: str = "to_site"  # to_site | from_site
+    map_thresholds_min: list[float] = field(default_factory=lambda: [5.0, 10.0, 15.0])
+
+    # Cross-platform default: SciPy. ``auto`` will use cuGraph only when it is
+    # installed and usable (normally Linux/WSL2 + NVIDIA); otherwise SciPy.
+    routing_backend: str = "auto"  # auto | scipy | cugraph
+    routing_workers: int = 0        # 0=auto; thread workers for SciPy chunks
+    routing_chunk_size: int = 24
 
 
 @dataclass
 class OptimizationConfig:
+    # Legacy MCLP knobs retained for compatibility.
     k_sites: int = 5
-    # Minimum number of each type forced into the solution
-    min_l2: int = 0
-    min_dcfc: int = 0
-    # Soft penalty price p for duplicating coverage (over-clustering control).
-    # gamma >= 0. Larger gamma spreads chargers out.
+    min_l2: int = 2
+    min_dcfc: int = 3
     gamma: float = 0.5
-    # Solver preference: "gurobi" (licensed) or "cbc" (open-source fallback)
-    # or "auto" (use gurobi if available, else cbc).
-    solver: str = "auto"
+
+    solver: str = "auto"  # auto | gurobi | cbc
     time_limit_s: int = 120
     mip_gap: float = 0.01
+
+    # V2/V3 budget-model spread controls. V1 ignored min_l2/min_dcfc and gamma in
+    # the primary budget model, which made one giant DCFC cluster a common
+    # optimum. These controls apply to the primary model.
+    min_sites_used: int = 5
+    max_sites_used: int = 0         # 0 = no explicit maximum
+    min_site_spacing_m: float = 0.0 # optional hard spacing between active sites
+    coverage_bonus: float = 0.25    # rewards geographic first-access as well as throughput
 
 
 @dataclass
 class BudgetConfig:
-    """Capacitated, budgeted charger sizing (the primary model).
-
-    budget: total spend ($) on installed chargers
-    cost_l2 / cost_dcfc: installed cost per charger of each class
-    cap_l2 / cap_dcfc: demand units one charger of that class can serve
-    site_max: max total chargers allowed at any single site (parking cap)
-    """
     budget: float = 1_500_000.0
     cost_l2: float = 50_000.0
     cost_dcfc: float = 150_000.0
     cap_l2: float = 15.0
     cap_dcfc: float = 60.0
-    site_max: int = 12
+
+    # Parking-aware site sizing. ``site_max`` remains a hard absolute fallback.
+    site_max: int = 6
+    parking_spaces_per_charger: float = 10.0
+    parking_m2_per_space: float = 30.0
+    min_site_max: int = 1
+
+
+@dataclass
+class ExistingConfig:
+    """How current public chargers affect new-site demand.
+
+    A value of 1.0 means existing coverage does not change demand. A value of
+    0.35 means cells already accessible to a current public charger retain 35%
+    of their original optimization weight, so the model prioritizes gaps while
+    still allowing reinforcement where demand is strong.
+    """
+
+    covered_demand_multiplier: float = 0.35
+    public_only: bool = True
 
 
 @dataclass
 class ZoningConfig:
-    """Optional zoning layer used to refine where apartment demand really is.
+    layers: list[str] = field(default_factory=list)
+    multifamily_column: str = ""
+    multifamily_values: list[str] = field(default_factory=list)
+    cell_multiplier: float = 1.5
 
-    Census ACS gives multifamily household *counts* per tract/block-group but
-    not exact locations. A municipal zoning layer (ArcGIS feature service) tells
-    us which parcels are actually designated multifamily. Cells whose centroid
-    falls inside a multifamily-designated zone get their census multifamily
-    weight multiplied by `cell_multiplier`; cells elsewhere keep the census
-    value. Empty `layers` (the default) keeps the pure census behavior.
+
+@dataclass
+class RegulationsConfig:
+    """Config-driven zoning/parking/EV regulatory screening layer.
+
+    This is deliberately a screening layer, not a legal determination. Rules
+    can be hard constraints only when a jurisdiction-specific profile marks
+    them as such; conditional or ambiguous requirements stay advisory.
     """
-    layers: list[str] = field(default_factory=list)      # ArcGIS feature-layer URLs
-    multifamily_column: str = ""                         # attribute holding the zone class
-    multifamily_values: list[str] = field(default_factory=list)  # values = multifamily
-    cell_multiplier: float = 1.5                         # boost for cells in MF zones
+
+    enabled: bool = False
+    jurisdiction: str = ""
+    as_of_date: str = ""
+    mode: str = "advisory"  # reserved for stricter jurisdiction profiles
+
+    # Optional parcel layer used to attach zoning/use context to OSM parking
+    # candidates. The default field names match Durham's public parcel layer.
+    parcel_layer_url: str = ""
+    parcel_id_field: str = "REID"
+    address_field: str = "LOCATION_ADDR"
+    zoning_field: str = "ZONING"
+    land_class_field: str = "LAND_CLASS"
+    units_field: str = "TOTAL_UNITS"
+    floor_area_field: str = "HEATED_AREA"
+    gla_field: str = "GROSS_LEASABLE_AREA"
+    request_workers: int = 6
+
+    # A planning/operations guardrail, not a law: never recommend converting
+    # more than this share of estimated existing parking stalls unless disabled
+    # with 0. The existing parking-derived site_max still also applies.
+    max_ev_share_existing_spaces: float = 0.15
+
+    # Unknown/missing GIS context is never silently treated as legal approval.
+    unknown_context_policy: str = "allow_with_review"  # allow_with_review | exclude
+
+    # Generic rule schema (dicts loaded from YAML). Supported selectors:
+    # zone_regex, land_class_regex. Supported calculations: parking_min_fixed,
+    # parking_min_per_unit, parking_min_per_1000_sf, parking_max_factor,
+    # ev_min_installed, prohibit_ev_charging, applicability, and manual_review.
+    # Parking rates are audited separately from charger-stall counts because an
+    # EV charging stall remains a parking stall; explicit prohibitions are the
+    # mechanism for true regulatory exclusion.
+    rules: list[dict] = field(default_factory=list)
 
 
 @dataclass
 class GridConfig:
-    """Grid-feasibility check that runs AFTER optimization and re-solves.
-
-    The budget MILP optimizes siting ignoring the distribution grid. When
-    enabled, each recommended site's aggregate charger load (count * kW per
-    charger * simultaneity) is compared against the available hosting capacity
-    from a utility feature layer. Sites that exceed `margin` of their capacity
-    are cut back (proportionally to the overload) and the MILP is re-solved so
-    the freed budget is spent at other sites. Repeats until feasible or
-    `max_iterations`.
-    """
     enabled: bool = False
-    layers: list[str] = field(default_factory=list)      # hosting-capacity feature layers
-    capacity_column: str = ""                            # available capacity attribute (kVA)
-    charger_power_kw: dict = field(
-        default_factory=lambda: {"l2": 7.2, "dcfc": 150.0}
-    )
-    simultaneity: float = 1.0        # fraction of chargers assumed loaded at peak
-    margin: float = 0.85             # max fraction of capacity a site may use
+    layers: list[str] = field(default_factory=list)
+    capacity_column: str = ""
+    charger_power_kw: dict = field(default_factory=lambda: {"l2": 7.2, "dcfc": 150.0})
+    simultaneity: float = 1.0
+    margin: float = 0.85
     max_iterations: int = 5
 
 
@@ -178,7 +221,9 @@ class OutputConfig:
     out_dir: str = "data/output"
     map_path: str = "ev_charger_map.html"
     results_path: str = "recommended_sites.csv"
-    charts_dir: str = "charts"
+    coverage_path: str = "coverage_summary.csv"
+    regulatory_path: str = "regulatory_audit.csv"
+    charts_dir: str = "data/output/charts"
 
     @property
     def map_full(self) -> str:
@@ -187,6 +232,14 @@ class OutputConfig:
     @property
     def results_full(self) -> str:
         return f"{self.out_dir}/{self.results_path}"
+
+    @property
+    def coverage_full(self) -> str:
+        return f"{self.out_dir}/{self.coverage_path}"
+
+    @property
+    def regulatory_full(self) -> str:
+        return f"{self.out_dir}/{self.regulatory_path}"
 
 
 @dataclass
@@ -198,22 +251,24 @@ class RegionConfig:
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    existing: ExistingConfig = field(default_factory=ExistingConfig)
     zoning: ZoningConfig = field(default_factory=ZoningConfig)
+    regulations: RegulationsConfig = field(default_factory=RegulationsConfig)
     grid: GridConfig = field(default_factory=GridConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
     @property
     def state_fips(self) -> str:
-        states = {c.state_fips for c in self.counties}
+        states = {c.state_fips.zfill(2) for c in self.counties}
         if len(states) != 1:
-            raise ValueError("All counties must be in the same state.")
+            raise ValueError("All counties in one run must be in the same state.")
         return next(iter(states))
 
     @property
     def state_abbr(self) -> str:
-        abbrs = {c.state_abbr for c in self.counties}
+        abbrs = {c.abbr() for c in self.counties}
         if len(abbrs) != 1:
-            raise ValueError("All counties must be in the same state.")
+            raise ValueError("All counties in one run must be in the same state.")
         return next(iter(abbrs))
 
     @property
@@ -222,17 +277,17 @@ class RegionConfig:
 
 
 def _parse_county(data: dict) -> County:
+    state_fips = str(data["state_fips"]).zfill(2)
     return County(
         name=data["name"],
-        state_fips=str(data["state_fips"]),
+        state_fips=state_fips,
         county_fips=str(data["county_fips"]).zfill(3),
-        state_abbr=data.get("state_abbr"),
+        state_abbr=data.get("state_abbr") or _STATE_ABBR.get(state_fips),
     )
 
 
 def load_config(path: str) -> RegionConfig:
-    """Load a region config from a YAML file."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     fetcher = FetcherConfig(
@@ -244,84 +299,128 @@ def load_config(path: str) -> RegionConfig:
         min_parking_m2=raw.get("min_parking_m2", 1000.0),
         min_parking_capacity=raw.get("min_parking_capacity", 20),
         candidate_tile_deg=raw.get("candidate_tile_deg", 0.1),
+        walk_network_buffer_m=raw.get("walk_network_buffer_m", 2500.0),
+        drive_network_buffer_m=raw.get("drive_network_buffer_m", 8000.0),
     )
 
-    demand_raw = raw.get("demand", {})
+    d = raw.get("demand", {})
     demand = DemandConfig(
-        grid_resolution_m=demand_raw.get("grid_resolution_m", 400),
-        alpha_traffic=demand_raw.get("alpha_traffic", 1.0),
-        beta_equity=demand_raw.get("beta_equity", 1.0),
-        income_weighted_equity=demand_raw.get("income_weighted_equity", False),
+        grid_resolution_m=d.get("grid_resolution_m", 400),
+        alpha_traffic=d.get("alpha_traffic", 1.0),
+        beta_equity=d.get("beta_equity", 1.0),
+        income_weighted_equity=d.get("income_weighted_equity", False),
+        traffic_influence_m=d.get("traffic_influence_m", 600.0),
     )
 
-    cov_raw = raw.get("coverage", {})
+    c = raw.get("coverage", {})
     coverage = CoverageConfig(
-        l2_walk_time_min=cov_raw.get("l2_walk_time_min", 20.0),
-        dcfc_drive_time_min=cov_raw.get("dcfc_drive_time_min", 20.0),
-        walk_speed_kph=cov_raw.get("walk_speed_kph", 4.8),
-        drive_default_speed_kph=cov_raw.get("drive_default_speed_kph", 35.0),
-        dcfc_min_aadt=cov_raw.get("dcfc_min_aadt", 0.0),
+        l2_walk_time_min=c.get("l2_walk_time_min", 10.0),
+        dcfc_drive_time_min=c.get("dcfc_drive_time_min", 10.0),
+        walk_speed_kph=c.get("walk_speed_kph", 4.8),
+        drive_default_speed_kph=c.get("drive_default_speed_kph", 35.0),
+        dcfc_min_aadt=c.get("dcfc_min_aadt", 0.0),
+        direction=c.get("direction", "to_site"),
+        map_thresholds_min=[float(x) for x in c.get("map_thresholds_min", [5, 10, 15])],
+        routing_backend=c.get("routing_backend", "auto"),
+        routing_workers=int(c.get("routing_workers", 0)),
+        routing_chunk_size=int(c.get("routing_chunk_size", 24)),
     )
 
-    opt_raw = raw.get("optimization", {})
+    o = raw.get("optimization", {})
     optimization = OptimizationConfig(
-        k_sites=opt_raw.get("k_sites", 5),
-        min_l2=opt_raw.get("min_l2", 0),
-        min_dcfc=opt_raw.get("min_dcfc", 0),
-        gamma=opt_raw.get("gamma", 0.5),
-        solver=opt_raw.get("solver", "auto"),
-        time_limit_s=opt_raw.get("time_limit_s", 120),
-        mip_gap=opt_raw.get("mip_gap", 0.01),
+        k_sites=int(o.get("k_sites", 5)),
+        min_l2=int(o.get("min_l2", 2)),
+        min_dcfc=int(o.get("min_dcfc", 3)),
+        gamma=float(o.get("gamma", 0.5)),
+        solver=o.get("solver", "auto"),
+        time_limit_s=int(o.get("time_limit_s", 120)),
+        mip_gap=float(o.get("mip_gap", 0.01)),
+        min_sites_used=int(o.get("min_sites_used", o.get("k_sites", 5))),
+        max_sites_used=int(o.get("max_sites_used", 0)),
+        min_site_spacing_m=float(o.get("min_site_spacing_m", 0.0)),
+        coverage_bonus=float(o.get("coverage_bonus", 0.25)),
     )
 
-    budget_raw = raw.get("budget", {})
+    b = raw.get("budget", {})
     budget = BudgetConfig(
-        budget=budget_raw.get("budget", 1_500_000.0),
-        cost_l2=budget_raw.get("cost_l2", 50_000.0),
-        cost_dcfc=budget_raw.get("cost_dcfc", 150_000.0),
-        cap_l2=budget_raw.get("cap_l2", 15.0),
-        cap_dcfc=budget_raw.get("cap_dcfc", 60.0),
-        site_max=budget_raw.get("site_max", 12),
+        budget=float(b.get("budget", 1_500_000.0)),
+        cost_l2=float(b.get("cost_l2", 50_000.0)),
+        cost_dcfc=float(b.get("cost_dcfc", 150_000.0)),
+        cap_l2=float(b.get("cap_l2", 15.0)),
+        cap_dcfc=float(b.get("cap_dcfc", 60.0)),
+        site_max=int(b.get("site_max", 6)),
+        parking_spaces_per_charger=float(b.get("parking_spaces_per_charger", 10.0)),
+        parking_m2_per_space=float(b.get("parking_m2_per_space", 30.0)),
+        min_site_max=int(b.get("min_site_max", 1)),
     )
 
-    zone_raw = raw.get("zoning", {})
+    e = raw.get("existing", {})
+    existing = ExistingConfig(
+        covered_demand_multiplier=float(e.get("covered_demand_multiplier", 0.35)),
+        public_only=bool(e.get("public_only", True)),
+    )
+
+    z = raw.get("zoning", {})
     zoning = ZoningConfig(
-        layers=zone_raw.get("layers", []),
-        multifamily_column=zone_raw.get("multifamily_column", ""),
-        multifamily_values=zone_raw.get("multifamily_values", []),
-        cell_multiplier=zone_raw.get("cell_multiplier", 1.5),
+        layers=z.get("layers", []),
+        multifamily_column=z.get("multifamily_column", ""),
+        multifamily_values=z.get("multifamily_values", []),
+        cell_multiplier=float(z.get("cell_multiplier", 1.5)),
     )
 
-    grid_raw = raw.get("grid", {})
+    r = raw.get("regulations", {})
+    regulations = RegulationsConfig(
+        enabled=bool(r.get("enabled", False)),
+        jurisdiction=str(r.get("jurisdiction", "")),
+        as_of_date=str(r.get("as_of_date", "")),
+        mode=str(r.get("mode", "advisory")),
+        parcel_layer_url=str(r.get("parcel_layer_url", "")),
+        parcel_id_field=str(r.get("parcel_id_field", "REID")),
+        address_field=str(r.get("address_field", "LOCATION_ADDR")),
+        zoning_field=str(r.get("zoning_field", "ZONING")),
+        land_class_field=str(r.get("land_class_field", "LAND_CLASS")),
+        units_field=str(r.get("units_field", "TOTAL_UNITS")),
+        floor_area_field=str(r.get("floor_area_field", "HEATED_AREA")),
+        gla_field=str(r.get("gla_field", "GROSS_LEASABLE_AREA")),
+        request_workers=int(r.get("request_workers", 6)),
+        max_ev_share_existing_spaces=float(r.get("max_ev_share_existing_spaces", 0.15)),
+        unknown_context_policy=str(r.get("unknown_context_policy", "allow_with_review")),
+        rules=list(r.get("rules", [])),
+    )
+
+    g = raw.get("grid", {})
     grid = GridConfig(
-        enabled=grid_raw.get("enabled", False),
-        layers=grid_raw.get("layers", []),
-        capacity_column=grid_raw.get("capacity_column", ""),
-        charger_power_kw=grid_raw.get("charger_power_kw",
-                                      {"l2": 7.2, "dcfc": 150.0}),
-        simultaneity=grid_raw.get("simultaneity", 1.0),
-        margin=grid_raw.get("margin", 0.85),
-        max_iterations=grid_raw.get("max_iterations", 5),
+        enabled=bool(g.get("enabled", False)),
+        layers=g.get("layers", []),
+        capacity_column=g.get("capacity_column", ""),
+        charger_power_kw=g.get("charger_power_kw", {"l2": 7.2, "dcfc": 150.0}),
+        simultaneity=float(g.get("simultaneity", 1.0)),
+        margin=float(g.get("margin", 0.85)),
+        max_iterations=int(g.get("max_iterations", 5)),
     )
 
-    out_raw = raw.get("output", {})
+    out = raw.get("output", {})
+    out_dir = out.get("out_dir", "data/output")
     output = OutputConfig(
-        out_dir=out_raw.get("out_dir", "data/output"),
-        map_path=out_raw.get("map_path", "ev_charger_map.html"),
-        results_path=out_raw.get("results_path", "recommended_sites.csv"),
-        charts_dir=out_raw.get("charts_dir", "charts"),
+        out_dir=out_dir,
+        map_path=out.get("map_path", "ev_charger_map.html"),
+        results_path=out.get("results_path", "recommended_sites.csv"),
+        coverage_path=out.get("coverage_path", "coverage_summary.csv"),
+        regulatory_path=out.get("regulatory_path", "regulatory_audit.csv"),
+        charts_dir=out.get("charts_dir", f"{out_dir}/charts"),
     )
 
-    counties = [_parse_county(c) for c in raw["counties"]]
     return RegionConfig(
         name=raw["name"],
-        counties=counties,
+        counties=[_parse_county(c) for c in raw["counties"]],
         fetcher=fetcher,
         demand=demand,
         coverage=coverage,
         optimization=optimization,
         budget=budget,
+        existing=existing,
         zoning=zoning,
+        regulations=regulations,
         grid=grid,
         output=output,
     )

@@ -17,9 +17,6 @@ _AADT_LAYER = (
     "services/NCDOT_AADTT_Traffic_Segmentation/FeatureServer/0"
 )
 
-# Most recent full-year AADT column in the layer.
-_LATEST_AADT = "AADT_2022"
-_YEAR = 2022
 
 
 def fetch_aadt(
@@ -39,8 +36,9 @@ def fetch_aadt(
 
     # Extract latest AADT + road class; build a clean frame.
     df = gdf.copy()
-    aadt = _latest_aadt_series(df)
+    aadt, aadt_year = _latest_aadt_series(df)
     df["aadt"] = aadt.values
+    df["aadt_year"] = aadt_year.values
 
     # Normalise standard columns (avoid duplicates from renames).
     renames = {
@@ -56,7 +54,6 @@ def fetch_aadt(
                 "location", "location_id", "name"]:
         if col in df.columns:
             out[col] = df[col]
-    out["aadt_year"] = _YEAR
 
     if counties is not None and "county" in out.columns:
         wanted = {str(c).upper() for c in counties}
@@ -69,18 +66,26 @@ def fetch_aadt(
     return out
 
 
-def _latest_aadt_series(df: pd.DataFrame) -> pd.Series:
-    """Return the most recent non-null AADT value per station."""
-    cands = [
-        c
-        for c in df.columns
-        if c.startswith("AADT_") and c != _LATEST_AADT
-    ]
-    # newest first
-    cands_sorted = sorted(cands, reverse=True)
-    out = pd.Series(0, index=df.index, dtype="float64")
-    for c in [c for c in cands_sorted if c != "AADT_2002"]:
-        val = pd.to_numeric(df[c], errors="coerce")
-        mask = val.notna() & (val > 0) & (out.isna() | (out <= 0))
-        out = out.mask(mask, val)
-    return out
+def _latest_aadt_series(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Return newest positive AADT and its year for every station.
+
+    V1 accidentally excluded ``AADT_2022`` while still labelling every station
+    as year 2022. This detects every ``AADT_YYYY`` field dynamically.
+    """
+    import re
+
+    cols = []
+    for c in df.columns:
+        m = re.fullmatch(r"AADT_(\d{4})", str(c))
+        if m:
+            cols.append((int(m.group(1)), c))
+    cols.sort(reverse=True)
+
+    out = pd.Series(0.0, index=df.index, dtype="float64")
+    yr = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    for year, col in cols:
+        val = pd.to_numeric(df[col], errors="coerce")
+        mask = (out <= 0) & val.notna() & (val > 0)
+        out.loc[mask] = val.loc[mask].astype(float)
+        yr.loc[mask] = year
+    return out, yr

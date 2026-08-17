@@ -187,7 +187,7 @@ def greedy_budget(
         "n_demand": n_demand,
         "n_chargers_total": int(y.sum()),
         "budget_spent": spent,
-        "n_sites_used": len(chargers),
+        "n_sites_used": len({j for j, _t, _n in chargers}),
         "demand_units_served": float(served_w),
         "frac_demand_served": float(served_w / total_w),
         "chargers_by_type": {

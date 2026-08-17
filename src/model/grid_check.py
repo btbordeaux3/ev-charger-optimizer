@@ -29,7 +29,7 @@ def site_capacity(
     sites: gpd.GeoDataFrame,
     grid: gpd.GeoDataFrame,
     capacity_column: str,
-    utm_epsg: int = 32617,
+    metric_crs=None,
 ) -> np.ndarray:
     """Return per-site available capacity (kVA).
 
@@ -46,10 +46,12 @@ def site_capacity(
         grid = grid.copy()
         grid["capacity"] = pd.to_numeric(grid[capacity_column], errors="coerce")
 
-    grid_proj = grid.to_crs(f"EPSG:{utm_epsg}") if str(grid.crs) != f"EPSG:{utm_epsg}" else grid
-    site_pts = sites.geometry.to_crs(f"EPSG:{utm_epsg}").centroid
+    if metric_crs is None:
+        metric_crs = sites.to_crs("EPSG:4326").estimate_utm_crs()
+    grid_proj = grid.to_crs(metric_crs) if str(grid.crs) != str(metric_crs) else grid
+    site_pts = sites.to_crs(metric_crs).geometry
 
-    pts = gpd.GeoDataFrame(geometry=site_pts, crs=f"EPSG:{utm_epsg}")
+    pts = gpd.GeoDataFrame(geometry=site_pts, crs=metric_crs)
     joined = gpd.sjoin(
         pts, grid_proj[["geometry", "capacity"]], how="left", predicate="within"
     )

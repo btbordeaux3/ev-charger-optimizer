@@ -1,7 +1,4 @@
-# Region configuration for the Durham-Orange (NC) study area.
-#
-# This is the ONLY file a user needs to edit to run the pipeline for a new
-# region: set the counties (FIPS codes), API keys, and tune the model params.
+# EV Charger Optimizer V2 — Durham + Orange Counties, NC
 name: "Durham-Orange NC"
 
 counties:
@@ -14,85 +11,83 @@ counties:
     county_fips: "135"
     state_abbr: NC
 
-# API keys. Get a free NREL key at https://developer.nlr.gov/signup/ and a
-# Census key at https://api.census.gov/data/key_signup.html. You can also set
-# these as NREL_API_KEY / CENSUS_API_KEY environment variables instead.
 nrel_api_key: ""
 census_api_key: ""
-
-# Municipal open-data candidate sites (optional). If you have an ArcGIS Hub /
-# Socrata feature layer of government-owned sites, list it here. When empty the
-# pipeline falls back to OSM public-facility POIs (parking, libraries, town
-# halls, community centers) which work for any region.
+cache_dir: "data/raw"
+road_network_source: "osmnx"
 municipal_layers: []
 
-road_network_source: "overpass"
-cache_dir: "data/raw"
+min_parking_m2: 1000
+min_parking_capacity: 20
+candidate_tile_deg: 0.10
+walk_network_buffer_m: 2500
+drive_network_buffer_m: 8000
 
 demand:
-  grid_resolution_m: 400          # edge length of each demand cell (meters)
-  alpha_traffic: 1.0              # weight on AADT traffic demand
-  beta_equity: 1.0                # weight on equity (multifamily renter) demand
-  income_weighted_equity: false   # multiply equity by low-income factor
+  grid_resolution_m: 400
+  alpha_traffic: 1.0
+  beta_equity: 1.0
+  income_weighted_equity: false
+  traffic_influence_m: 600
 
 coverage:
-  l2_walk_time_min: 20              # Level 2 walking-time isochrone cap (min)
-  dcfc_drive_time_min: 20           # DC fast driving-time isochrone cap (min)
-  walk_speed_kph: 4.8               # assumed walking speed
-  drive_default_speed_kph: 35.0     # fallback drive speed (per-class from OSM tags)
-  dcfc_min_aadt: 0.0                # only allow DCFC coverage of high-traffic cells
+  l2_walk_time_min: 10
+  dcfc_drive_time_min: 10
+  walk_speed_kph: 4.8
+  drive_default_speed_kph: 35.0
+  dcfc_min_aadt: 0.0
+  direction: "to_site"
+  map_thresholds_min: [5, 10, 15]
+  routing_backend: "auto"
+  routing_workers: 0
+  routing_chunk_size: 24
 
 optimization:
-  k_sites: 5                      # number of chargers to site (legacy MCLP model)
-  min_l2: 2                       # minimum Level 2 sites (local residents)
-  min_dcfc: 3                     # minimum DC fast sites (corridor)
-  gamma: 0.5                      # penalty on duplicated coverage (spread)
-  solver: "auto"                  # auto | gurobi | cbc
-  time_limit_s: 120
+  min_l2: 2
+  min_dcfc: 3
+  min_sites_used: 6
+  max_sites_used: 0
+  min_site_spacing_m: 0
+  coverage_bonus: 0.25
+  k_sites: 6
+  gamma: 0.5
+  solver: "auto"
+  time_limit_s: 180
   mip_gap: 0.01
 
-# Capacitated budget model (the primary tool): spend a fixed budget on any mix
-# of chargers, any site can host a cluster up to site_max, and charger capacity
-# caps how much nearby demand it can actually serve.
 budget:
-  budget: 1500000                 # total spend ($) on installed chargers
-  cost_l2: 50000                  # installed cost per Level 2 charger ($)
-  cost_dcfc: 150000               # installed cost per DC fast charger ($)
-  cap_l2: 15                      # demand units one L2 charger can serve
-  cap_dcfc: 60                    # demand units one DCFC charger can serve
-  site_max: 12                    # max chargers at a single site (parking cap)
+  budget: 1500000
+  cost_l2: 50000
+  cost_dcfc: 150000
+  cap_l2: 15
+  cap_dcfc: 60
+  site_max: 6
+  parking_spaces_per_charger: 10
+  parking_m2_per_space: 30
+  min_site_max: 1
 
-# Optional: municipal zoning layer that refines WHERE census multifamily demand
-# really is. Cells inside multifamily-designated zones get their census equity
-# weight boosted by `cell_multiplier`. Leave layers empty to use pure census.
-# Example (city GIS ArcGIS feature service):
-#   layers:
-#     - "https://<city>/arcgis/rest/services/zoning/FeatureServer/0"
-#   multifamily_column: "ZONING"       # attribute holding the zone class
-#   multifamily_values: ["R-5", "RM", "RU-5"]   # values = multifamily zones
+existing:
+  covered_demand_multiplier: 0.35
+  public_only: true
+
 zoning:
   layers: []
   multifamily_column: ""
   multifamily_values: []
   cell_multiplier: 1.5
 
-# Optional: post-optimization grid-feasibility check. After the MILP picks a
-# plan, each site's charger load (count * kW * simultaneity) is compared against
-# available hosting capacity from a utility feature layer; overloaded sites are
-# cut back and the MILP re-solved so the freed budget goes elsewhere. Needs a
-# hosting-capacity layer with a numeric capacity column (kVA). When disabled or
-# unconfigured the plan is used as-is.
 grid:
   enabled: false
-  layers: []                       # e.g. utility ICA / transformer capacity layer
-  capacity_column: ""              # attribute with available capacity (kVA)
+  layers: []
+  capacity_column: ""
   charger_power_kw: {l2: 7.2, dcfc: 150.0}
-  simultaneity: 1.0                # fraction of chargers loaded at peak
-  margin: 0.85                     # max fraction of capacity a site may use
+  simultaneity: 1.0
+  margin: 0.85
   max_iterations: 5
 
 output:
   out_dir: "data/output"
   map_path: "ev_charger_map.html"
   results_path: "recommended_sites.csv"
+  coverage_path: "coverage_summary.csv"
   charts_dir: "data/output/charts"

@@ -1,10 +1,17 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
-data/raw/
-data/processed/
-cache/
-*.ipynb_checkpoints/
 .DS_Store
 *.lic
+
+# Fetched/cached data and generated outputs
+data/raw/*
+!data/raw/.gitkeep
+data/processed/
+data/output/*
+!data/output/.gitkeep
+data/output_durham/
+cache/
+*.ipynb_checkpoints/
